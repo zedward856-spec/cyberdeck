@@ -1,0 +1,14 @@
+[Unit]
+Description=Cyberdeck display-only localhost VNC mirror of the physical Kali display
+Wants=lightdm.service
+After=lightdm.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/cyberdeck-display-mode
+ExecStart=/usr/bin/x11vnc -display :0 -auth /var/run/lightdm/root/:0 -localhost -rfbport 5901 -nopw -forever -shared -xkb -repeat -threads -wait 20 -defer 15 -deferupdate 15 -deferptrupdate 0 -cursor most -cursorpos
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

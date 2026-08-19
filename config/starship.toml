@@ -1,0 +1,37 @@
+add_newline = true
+format = "$username$hostname$directory$git_branch$git_status$cmd_duration$line_break$character"
+
+[username]
+show_always = true
+format = "[$user]($style)"
+style_user = "bold #367bf0"
+style_root = "bold #c9342f"
+
+[hostname]
+ssh_only = false
+format = "[@$hostname ]($style)"
+style = "bold #367bf0"
+
+[directory]
+format = "[$path ]($style)"
+style = "bold #5fd7ff"
+truncation_length = 3
+truncation_symbol = ".../"
+
+[git_branch]
+symbol = ""
+format = "[($branch) ]($style)"
+style = "#8a6ef0"
+
+[git_status]
+format = "[$all_status$ahead_behind]($style) "
+style = "#e0a445"
+
+[cmd_duration]
+min_time = 500
+format = "[took $duration ]($style)"
+style = "#3d5468"
+
+[character]
+success_symbol = "[>_](bold #367bf0)"
+error_symbol = "[>_](bold #c9342f)"

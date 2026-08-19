@@ -1,0 +1,39 @@
+#!/bin/sh
+# xsecurelock saver: draw the NFC scanning panel AS the lock screen.
+# Verbose while we establish whether xsecurelock runs us at all.
+L=/tmp/cyberdeck-saver.log
+say() { echo "$(date '+%T') $*" >> "$L" 2>/dev/null; logger -t cyberdeck-saver "$*"; }
+
+say "SAVER STARTED win=${XSCREENSAVER_WINDOW:-UNSET} display=${DISPLAY:-UNSET} xauth=${XAUTHORITY:-UNSET} user=$(id -un)"
+
+if [ -z "$XSCREENSAVER_WINDOW" ]; then
+    say "no XSCREENSAVER_WINDOW - exiting"
+    exit 1
+fi
+
+CYBERDECK_PANEL_PERSIST=1 /usr/local/bin/cyberdeck-nfc-status >>"$L" 2>&1 &
+PANEL_PID=$!
+say "panel launched pid=$PANEL_PID"
+
+WIN=""
+i=0
+while [ "$i" -lt 100 ]; do
+    kill -0 "$PANEL_PID" 2>/dev/null || { say "panel died after ${i} tries"; break; }
+    WIN=$(xdotool search --pid "$PANEL_PID" 2>/dev/null | head -1)
+    [ -n "$WIN" ] && break
+    sleep 0.1
+    i=$(( i + 1 ))
+done
+
+if [ -n "$WIN" ]; then
+    say "found window $WIN after ${i} tries, reparenting into $XSCREENSAVER_WINDOW"
+    xdotool windowreparent "$WIN" "$XSCREENSAVER_WINDOW" 2>>"$L"
+    xdotool windowmove "$WIN" 0 0 2>>"$L"
+    xdotool windowmap "$WIN" 2>>"$L"
+    say "reparent done"
+else
+    say "panel window never appeared"
+fi
+
+wait "$PANEL_PID"
+say "panel exited, saver ending"

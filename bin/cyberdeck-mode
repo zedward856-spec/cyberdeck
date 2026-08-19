@@ -1,0 +1,25 @@
+#!/bin/sh
+
+set -eu
+
+MODE_DIR="$HOME/.config/cyberdeck"
+MODE_FILE="$MODE_DIR/boot-mode"
+
+case "${1:-status}" in
+    cli|desktop)
+        mkdir -p "$MODE_DIR"
+        printf '%s\n' "$1" >"$MODE_FILE"
+        printf 'Next login/boot mode: %s\n' "$1"
+        ;;
+    status)
+        if [ -r "$MODE_FILE" ]; then
+            sed -n '1p' "$MODE_FILE"
+        else
+            printf 'desktop\n'
+        fi
+        ;;
+    *)
+        printf 'Usage: cyberdeck-mode {cli|desktop|status}\n' >&2
+        exit 2
+        ;;
+esac

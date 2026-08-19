@@ -1,0 +1,12 @@
+# secrets - never publish
+**/fast.bin
+*.key
+*.pem
+id_ed25519*
+id_rsa*
+# build artifacts / backups
+*.pre-*
+*.bak-*
+*.disabled
+cyberterm/cyberterm
+*.o

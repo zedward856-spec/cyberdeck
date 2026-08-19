@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""NFC status overlay for the lightdm greeter.
+
+lightdm-gtk-greeter's own message area - where "Incorrect password" appears -
+is only writable from inside a PAM conversation, and while the greeter is
+sitting idle there is no conversation running. So the card state cannot be put
+there directly. This draws a small always-on-top panel in the same place
+instead, fed by a state file the watcher writes.
+
+Started from lightdm's greeter-setup-script, and exits by itself the moment a
+desktop session appears so it can never end up floating over the desktop.
+"""
+
+import os
+import subprocess
+import sys
+import time
+
+try:
+    import tkinter as tk
+except Exception:
+    sys.exit(0)
+
+STATE = "/run/cyberdeck-nfc/state"
+POLL_MS = 60
+
+# Sampled off the greeter itself: the login box body is #23252e. The panel used
+# near-black, which read as a hole punched in the screen rather than a sibling
+# of the login box.
+BG      = "#23252e"
+DIM     = "#3d5468"
+KALI    = "#367bf0"
+CYAN    = "#22d3ee"
+GREEN   = "#39e88a"
+AMBER   = "#ffb020"
+RED     = "#ff3b54"
+
+# SCAN and LOGIN both ride the wallpaper's own accent - KALI = (54, 123, 240)
+# in cyberdeck-mkwallpaper, the blue under the CYBERDECK wordmark - so the
+# scanning bar reads as part of the backdrop rather than a foreign cyan. The
+# outcome states keep their own colours, because those carry meaning.
+COLOUR = {"SCAN": KALI, "READ": GREEN, "LOGIN": KALI,
+          "BAD": RED, "LOCK": AMBER, "IDLE": DIM}
+
+CORPTA  = "Corpta DEMO"
+NUMERAL = "Chakra Petch"
+
+# Fraction of screen height for the panel's top edge. The greeter's login box
+# is centred, so this sits just below it, where its own messages appear.
+Y_FRACTION = 0.62
+
+
+def read_state():
+    try:
+        with open(STATE) as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return "IDLE", "READY TO SCAN", -1.0
+    parts = raw.split("|")
+    if len(parts) < 3:
+        return "IDLE", "READY TO SCAN", -1.0
+    try:
+        prog = float(parts[2])
+    except ValueError:
+        prog = -1.0
+    return parts[0], parts[1], prog
+
+
+def screen_size(root):
+    """Ask X, not Tk.
+
+    Tk caches the screen dimensions from when it connected and never notices a
+    RandR mode change. This panel starts while X is still 1024x768 and the mode
+    switches to 1920x1080 underneath it, so winfo_screenwidth() kept insisting
+    on the old size and the panel stayed parked over the login box.
+    """
+    try:
+        out = subprocess.check_output(["/usr/bin/xdotool", "getdisplaygeometry"],
+                                      stderr=subprocess.DEVNULL, timeout=4)
+        w, h = out.decode().split()[:2]
+        return int(w), int(h)
+    except Exception:
+        return root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+_last_check = [0.0, False]
+
+
+def session_up():
+    """Throttled: this runs on the redraw tick, and spawning pgrep six times a
+    second would both waste a Pi core and flood the launcher's process stream."""
+    now = time.time()
+    if now - _last_check[0] < 2.0:
+        return _last_check[1]
+    try:
+        up = subprocess.call(["pgrep", "-u", "kali", "-x", "xfce4-session"],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL) == 0
+    except Exception:
+        up = False
+    _last_check[0], _last_check[1] = now, up
+    return up
+
+
+class Panel:
+    def __init__(self, root):
+        self.root = root
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        self.w, self.h = 720, 132
+        self.x = (sw - self.w) // 2
+        self.y = int(sh * Y_FRACTION)
+        self.geo = "%dx%d+%d+%d" % (self.w, self.h, self.x, self.y)
+        root.overrideredirect(True)
+        root.geometry(self.geo)
+        root.configure(bg=BG)
+        root.attributes("-topmost", True)
+
+        self.c = tk.Canvas(root, width=self.w, height=self.h,
+                           bg=BG, highlightthickness=0)
+        self.c.pack()
+        # Setting overrideredirect before the window is realised makes Tk honour
+        # the size but drop the offset, which landed this on top of the login
+        # box instead of under it. Re-assert once it actually exists.
+        root.update_idletasks()
+        root.geometry(self.geo)
+        self.phase = 0
+        self.last = None
+        self.raise_in = 0
+        self.static_key = None   # what the last FULL redraw was drawn for
+        self.sweep_id = None     # canvas id of the moving bar - moved, not recreated
+        self.last_raise = 0.0    # wall clock, so raise cadence is independent of POLL_MS
+        self.tick()
+
+    def draw(self, state, text, prog):
+        c = self.c
+        col = COLOUR.get(state, DIM)
+        bx0, bx1, by = 18, self.w - 18, 74
+
+        # Only the sweep moves between frames. Deleting and recreating every
+        # item each frame cost 32% of one core at 60ms on this Pi, for a bar
+        # that is the sole thing changing - so redraw the static parts only
+        # when they actually change, and move the sweep with coords().
+        key = (state, text, round(prog, 1), col, self.w, self.h)
+        if key == self.static_key:
+            self._move_sweep(bx0, bx1, by)
+            return
+        self.static_key = key
+        self.sweep_id = None
+        c.delete("all")
+
+        # bracket, so it reads as part of the deck rather than a stray dialog
+        c.create_line(0, 0, 26, 0, fill=col, width=2)
+        c.create_line(0, 0, 0, 26, fill=col, width=2)
+        c.create_line(self.w - 26, self.h - 1, self.w, self.h - 1, fill=col, width=2)
+        c.create_line(self.w - 1, self.h - 26, self.w - 1, self.h, fill=col, width=2)
+
+        c.create_text(18, 26, anchor="w", text="NFC", fill=DIM,
+                      font=(CORPTA, 13))
+        c.create_text(80, 26, anchor="w", text=text.upper(), fill=col,
+                      font=(CORPTA, 15))
+
+        c.create_rectangle(bx0, by, bx1, by + 14, outline="#16283a")
+
+        if prog >= 0:
+            # real progress: the login phase, which the watcher can time
+            fill = bx0 + (bx1 - bx0) * max(0.0, min(1.0, prog / 100.0))
+            c.create_rectangle(bx0, by, fill, by + 14, fill=col, outline="")
+            c.create_text(bx1, by + 34, anchor="e", text="%d%%" % int(prog),
+                          fill=DIM, font=(NUMERAL, 11))
+        elif state in ("SCAN", "READ"):
+            # indeterminate: a sweep, because the reader gives no progress.
+            # Created once here; every later frame only calls coords() on it.
+            self.sweep_id = c.create_rectangle(bx0, by, bx0, by + 14,
+                                               fill=col, outline="")
+
+        c.create_text(18, by + 34, anchor="w",
+                      text="HOLD THE CARD ON THE READER" if state == "SCAN" else "",
+                      fill=DIM, font=(CORPTA, 10))
+
+    def _move_sweep(self, bx0, bx1, by):
+        if self.sweep_id is None:
+            return
+        span = (bx1 - bx0) * 0.22
+        pos = (self.phase % 100) / 100.0
+        a = bx0 + (bx1 - bx0 + span) * pos - span
+        try:
+            self.c.coords(self.sweep_id, max(bx0, a), by,
+                          min(bx1, a + span), by + 14)
+        except Exception:
+            self.static_key = None      # force a rebuild next frame
+
+    def tick(self):
+        if not os.environ.get("CYBERDECK_PANEL_PERSIST") and session_up():
+            self.root.destroy()
+            return
+        state, text, prog = read_state()
+        self.phase += 0.8
+        self.draw(state, text, prog)
+        # There is no window manager at the greeter, so -topmost is inert and
+        # stacking is simply whoever mapped last. This panel is created when X
+        # starts and the greeter maps after it, which buried it completely -
+        # running, drawing, invisible. Raise it ourselves, but not every frame.
+        # Wall clock, NOT a frame count: screen_size() spawns xdotool, and
+        # tying it to frames meant raising POLL_MS silently multiplied the
+        # subprocess rate - which is what actually made the smoother sweep
+        # expensive, not the drawing.
+        now = time.time()
+        if now - self.last_raise >= 2.0:
+            self.last_raise = now
+            try:
+                # Recompute, do not cache: this starts from display-setup-script
+                # while X is still 1024x768 and the mode changes to 1920x1080
+                # underneath us. Centring once put the panel at 150,475 - over
+                # the login box instead of below it.
+                sw, sh = screen_size(self.root)
+                self.geo = "%dx%d+%d+%d" % (self.w, self.h,
+                                            (sw - self.w) // 2,
+                                            int(sh * Y_FRACTION))
+                self.root.geometry(self.geo)
+                self.root.lift()
+            except Exception:
+                pass
+        self.root.after(POLL_MS, self.tick)
+
+
+def main():
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":0"
+    # lightdm hands greeter-setup-script a DISPLAY but no XAUTHORITY, and as
+    # root that means Tk cannot open the display at all - the first version of
+    # this ran happily and drew nothing.
+    if not os.environ.get("XAUTHORITY"):
+        for cand in ("/var/run/lightdm/root/:0", "/var/lib/lightdm/.Xauthority"):
+            if os.path.exists(cand):
+                os.environ["XAUTHORITY"] = cand
+                break
+    for _ in range(40):                      # wait for X to accept connections
+        try:
+            root = tk.Tk()
+            break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        return
+    Panel(root)
+    try:
+        root.mainloop()
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()

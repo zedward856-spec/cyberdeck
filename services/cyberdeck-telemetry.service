@@ -1,0 +1,22 @@
+[Unit]
+Description=Cyberdeck telemetry endpoint for the phone launcher
+After=network.target
+
+[Service]
+Type=simple
+User=kali
+Group=kali
+ExecStart=/usr/local/bin/cyberdeck-telemetry
+Restart=always
+RestartSec=3
+Nice=10
+# read-only sampler: it needs nothing but /proc and /sys
+ProtectSystem=strict
+# read-only, not yes: locking needs to read the session's
+# /home/kali/.Xauthority to talk to the X display
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

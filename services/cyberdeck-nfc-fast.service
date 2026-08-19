@@ -1,0 +1,14 @@
+[Unit]
+Description=Cyberdeck fast PN532 card reader
+After=multi-user.target
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=/usr/local/lib/cyberdeck-nfc-py
+ExecStart=/usr/local/bin/cyberdeck-nfc-fast
+Restart=always
+RestartSec=5
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

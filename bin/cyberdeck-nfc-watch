@@ -1,0 +1,397 @@
+#!/bin/sh
+# Continuous NFC login watcher.
+#
+# `cyberdeck-nfc-auth pam` blocks until a card appears and returns 0 the moment
+# a valid one is presented, so calling it in a loop gives genuinely continuous
+# scanning - unlike lightdm's autologin, which only sampled it for 8s every 90s.
+#
+# Telling a WRONG card from NO card by TIMING does not work, and the attempt was
+# actively breaking the deck. Measured on this reader, an empty poll returns
+# after 4s, 5s, 6s, 15s, 25s - straddling any threshold you pick. So most empty
+# polls were being counted as rejected cards, five of those tripped the lockout
+# within a minute of reaching the greeter, and the watcher then refused to scan
+# for 300 seconds. That, not the reader, is what made tapping feel dead.
+#
+# There is no signal here that separates "wrong card" from "no card", so the
+# lockout is off rather than wrong. Cards are unlimited-attempt now; the trade
+# is deliberate, and the password fallback is untouched.
+set -u
+
+HELPER=/usr/local/libexec/cyberdeck-nfc-auth
+ADB=/usr/bin/adb
+SERIAL=049a37d425226dff
+# the adb server belongs to kali, so root has to go through it as kali
+adb_kali() { timeout 10 runuser -u kali -- env HOME=/home/kali "$@" 2>/dev/null; }
+LOCK=/run/cyberdeck-nfc/lockout
+USER_NAME=kali
+FAST=15          # kept only for logging; no longer gates anything
+COUNT_BAD=0      # 1 to re-enable rejection counting, if the reader ever grows
+                 # a way to say "I saw a card and refused it"
+WAIT_SECS=120    # wall-clock patience for a login to complete
+MAX_BAD=5        # after this many rejections, force password
+LOCK_SECS=300    # how long the lockout lasts
+
+log() { logger -t cyberdeck-nfc-watch -- "$1"; }
+
+# Published for the greeter overlay: state|text|progress (-1 = indeterminate).
+# The greeter's own message area only exists during a PAM conversation, so
+# there is nowhere else to put this while it sits idle waiting for a card.
+STATE=/run/cyberdeck-nfc/state
+say() {
+    mkdir -p /run/cyberdeck-nfc 2>/dev/null
+    echo "$1|$2|${3:--1}" > "$STATE" 2>/dev/null
+    chmod 644 "$STATE" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- fast path
+#
+# cyberdeck-nfc-fast holds the PN532 open over I2C and republishes card state
+# continuously. Reading its file costs nothing, where the libnfc helper cost
+# 3.7 SECONDS per call just to open the reader - measured with nfc-list - and
+# this loop was paying that on every poll.
+#
+# When that daemon is running it owns the bus exclusively, so the helper must
+# not be invoked at all; two things driving the PN532 at once is how the reader
+# got wedged off the bus earlier.
+FASTCARD=/run/cyberdeck-nfc/card
+
+fast_available() {
+    systemctl is-active --quiet cyberdeck-nfc-fast 2>/dev/null || return 1
+    [ -f "$FASTCARD" ]
+}
+
+# 0 = our card is on the reader right now
+fast_valid() {
+    case "$(cat "$FASTCARD" 2>/dev/null)" in
+        VALID*) return 0 ;;
+    esac
+    return 1
+}
+
+# 0 = the reader is confirmed empty (used to re-arm after a grant)
+fast_empty() {
+    case "$(cat "$FASTCARD" 2>/dev/null)" in
+        NONE*) return 0 ;;
+    esac
+    return 1
+}
+
+# A logged-out session can linger in `loginctl list-sessions` as a dead record.
+# Matching on presence alone made the watcher believe someone was logged in and
+# stop scanning entirely, so neither login nor unlock worked. Require the
+# session to actually be Active, and back it with a real process check.
+session_active() {
+    sid=$(loginctl list-sessions --no-legend 2>/dev/null \
+          | awk -v u="$USER_NAME" '$3==u && $4=="seat0"{print $1}' | head -1)
+    [ -n "$sid" ] || return 1
+    [ "$(loginctl show-session "$sid" -p Active --value 2>/dev/null)" = "yes" ] || return 1
+    pgrep -u "$USER_NAME" -f xfce4-session >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# Export the logged-in session's X credentials so xdotool can reach its display
+# (the greeter's Xauthority is a different file and will not work here).
+#
+# DBUS_SESSION_BUS_ADDRESS matters just as much and used to be missing. Without
+# it xfce4-screensaver-command does not fail - it quietly autolaunches a PRIVATE
+# session bus that has no screensaver on it, answers from that, and leaves a
+# stray dbus-daemon behind. So every lock query was being asked of the wrong bus,
+# and deactivate had nothing to talk to.
+session_env() {
+    p=$(pgrep -u "$USER_NAME" -x xfce4-session | head -1)
+    [ -n "$p" ] || return 1
+    eval export $(tr '\0' '\n' < /proc/$p/environ \
+        | grep -E '^(DISPLAY|XAUTHORITY|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR)=' \
+        | sed 's/^/"/; s/$/"/')
+    [ -n "${DISPLAY:-}" ]
+}
+
+# Run a session command AS the session's owner.
+#
+# Root cannot use kali's session bus: D-Bus authenticates with EXTERNAL, which
+# checks the peer uid, and the bus only accepts its owner. Root is not exempt.
+# It does not fail loudly either - dbus quietly autolaunches a private bus, the
+# screensaver is not on it, and every query comes back wrong while a stray
+# dbus-daemon piles up. So drop to kali and carry the session's env in.
+as_user() {
+    runuser -u "$USER_NAME" -- env \
+        DISPLAY="${DISPLAY:-}" \
+        XAUTHORITY="${XAUTHORITY:-}" \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+        "$@"
+}
+
+screen_locked() {
+    sid=$(loginctl list-sessions --no-legend 2>/dev/null \
+          | awk -v u="$USER_NAME" '$3==u && $4=="seat0"{print $1}' | head -1)
+    [ -n "$sid" ] && \
+        [ "$(loginctl show-session "$sid" -p LockedHint --value 2>/dev/null)" = "yes" ] && return 0
+    session_env || return 1
+    as_user xfce4-screensaver-command -q 2>/dev/null | grep -qi 'is active' && return 0
+    return 1
+}
+
+# Cheap "is it still locked" for the tight loop below. screen_locked() is far
+# too heavy to poll at this rate - it shells out to loginctl and pgrep as well.
+still_locked() { as_user xfce4-screensaver-command -q 2>/dev/null | grep -qi 'is active'; }
+
+unlock_screen() {
+    session_env || return 1
+    t0=$(date +%s%N)
+
+    # Ask the screensaver to deactivate. Measured at 107-132ms.
+    #
+    # The slow path this replaces drove the password dialog with xdotool, and
+    # could not be made fast: the dialog takes 5-7s to even draw on this Pi, and
+    # a Return sent before it exists is swallowed raising it. That put a floor of
+    # about 8s on every unlock.
+    #
+    # This skips PAM, so the token is not what authorises it. That is fine and
+    # deliberate: the card has ALREADY been validated by the helper above, so the
+    # decision is made either way and this is only the mechanism for dismissing
+    # the lock. It grants nothing to an attacker at a locked screen - reaching
+    # this code needs a shell in the running session, which is game over already.
+    as_user xfce4-screensaver-command -d >/dev/null 2>&1
+    i=0
+    while [ $i -lt 20 ]; do
+        if ! still_locked; then
+            log "unlocked in $(( ( $(date +%s%N) - t0 ) / 1000000 ))ms"
+            return 0
+        fi
+        sleep 0.05
+        i=$(( i + 1 ))
+    done
+
+    # Fallback: drive the dialog the slow way, through PAM and the token.
+    log "deactivate did not take - falling back to the password dialog"
+    as_user xdotool key --clearmodifiers space >/dev/null 2>&1
+    sleep 8
+    as_user xdotool key --clearmodifiers Return >/dev/null 2>&1
+}
+
+bad=0
+# A card left sitting on the reader must not grant over and over. After any
+# grant the watcher disarms, and only re-arms once it has seen the reader come
+# back empty. Without this, a failed login re-granted immediately and restarted
+# lightdm on top of the session that was still starting - which is exactly how
+# the deck ended up stuck at the greeter, thrashing every 50 seconds.
+armed=1
+log "started - scanning continuously"
+
+while :; do
+    # Logged in and NOT locked: stop touching the reader entirely.
+    if session_active && ! screen_locked; then
+        [ "$bad" -ne 0 ] && { bad=0; rm -f "$LOCK"; }
+        # How long a freshly-locked screen waits before the loop even notices.
+        # Only matters if you tap immediately after locking - once locked, the
+        # branch below polls at 0.2s - but 5s was long enough to feel broken.
+        sleep 2
+        continue
+    fi
+
+    # Logged in but LOCKED: scan, and a valid card unlocks in place.
+    # Nothing restarts, so the display never even blinks.
+    if session_active; then
+        say SCAN "SCANNING FOR CARD"
+        if fast_available; then
+            t0=$(date +%s%N)
+            if fast_valid; then rc=0; else rc=1; fi
+            dtms=$(( ( $(date +%s%N) - t0 ) / 1000000 ))
+            dt=0
+            out=""
+            fast_empty && armed=1
+            [ "$rc" -eq 0 ] && log "card seen while locked after ${dtms}ms"
+        else
+            t0=$(date +%s%N)
+            out=$(PAM_USER="$USER_NAME" PAM_SERVICE=xfce4-screensaver PAM_TYPE=auth \
+                  "$HELPER" pam 2>&1)
+            rc=$?
+            dtms=$(( ( $(date +%s%N) - t0 ) / 1000000 ))
+            dt=$(( dtms / 1000 ))
+            [ "$rc" -eq 0 ] && log "card seen while locked after ${dtms}ms"
+            case "$out" in
+                *PN532*|*could\ not\ be\ opened*|*busy*)
+                    log "reader error while locked: $out"; sleep 5; continue ;;
+            esac
+        fi
+        if [ "$rc" -eq 0 ]; then
+            [ "$armed" -eq 1 ] || { sleep 2; continue; }   # card never left the reader
+            mkdir -p /run/cyberdeck-nfc 2>/dev/null
+            date +%s > "$TOKEN"; chmod 640 "$TOKEN" 2>/dev/null
+            bad=0
+            armed=0
+            say READ "CARD ACCEPTED"
+            unlock_screen
+            i=0
+            while [ $i -lt 6 ]; do
+                screen_locked || break
+                sleep 1; i=$(( i + 1 ))
+            done
+            if screen_locked; then
+                log "unlock submit did not take"
+            else
+                log "unlocked by card - display never dropped"
+            fi
+            rm -f "$TOKEN"
+            sleep 4
+        elif [ "$COUNT_BAD" -eq 1 ] && [ "$dt" -lt "$FAST" ]; then
+            bad=$(( bad + 1 ))
+            log "card rejected while locked ($bad/$MAX_BAD)"
+            [ "$bad" -ge "$MAX_BAD" ] && { date +%s > "$LOCK"; log "$MAX_BAD rejected - password only for ${LOCK_SECS}s"; }
+            sleep 2
+        else
+            armed=1        # ran to its own timeout: the reader is empty again
+            sleep 0.1      # locked: keep the gap short, a tap must feel instant
+        fi
+        continue
+    fi
+
+    # Locked out after too many bad cards: password only until it expires.
+    if [ -f "$LOCK" ]; then
+        set -- $(cat "$LOCK" 2>/dev/null) 0
+        if [ $(( $(date +%s) - ${1:-0} )) -lt "$LOCK_SECS" ]; then
+            sleep 5
+            continue
+        fi
+        rm -f "$LOCK"; bad=0
+        log "lockout expired - scanning again"
+    fi
+
+    say SCAN "SCANNING FOR CARD"
+    if fast_available; then
+        if fast_valid; then rc=0; else rc=1; fi
+        dt=0
+        out=""
+        fast_empty && armed=1
+        [ "$rc" -eq 0 ] && log "card seen at the greeter"
+    else
+        t0=$(date +%s)
+        out=$(PAM_USER="$USER_NAME" PAM_SERVICE=lightdm PAM_TYPE=auth "$HELPER" pam 2>&1)
+        rc=$?
+        dt=$(( $(date +%s) - t0 ))
+        log "scan returned rc=$rc after ${dt}s"
+    fi
+
+    # A reader that will not open also fails fast, and must NOT be mistaken for
+    # somebody presenting a bad card - that was locking the deck out spuriously.
+    case "$out" in
+        *PN532*|*could\ not\ be\ opened*|*busy*)
+            log "reader error: $out"
+            say BAD "READER ERROR"
+            sleep 5
+            continue
+            ;;
+    esac
+
+    if [ "$rc" -eq 0 ]; then
+        [ "$armed" -eq 1 ] || { sleep 2; continue; }   # card never left the reader
+        mkdir -p /run/cyberdeck-nfc 2>/dev/null
+        date +%s > "$TOKEN"
+        chmod 640 "$TOKEN" 2>/dev/null
+        bad=0
+        armed=0
+        say READ "CARD ACCEPTED"
+        log "valid card - granting login"
+
+        # Restart lightdm so autologin runs; its PAM side is an instant token
+        # check that never touches the reader.
+        #
+        # I tried driving the greeter with xdotool to avoid restarting X, but
+        # lightdm-gtk-greeter does not submit on a bare Return - the keystrokes
+        # instead landed on the NEXT greeter after the fallback restart and
+        # fired spurious auth attempts that consumed the token and raced the
+        # real autologin. Restarting is slower but deterministic.
+        t_start=$(date +%s)
+        systemctl restart lightdm
+        # Wall clock, not an iteration count. `sleep 1` plus two loginctl calls
+        # and a pgrep is not one second - while logind is mid-setup those calls
+        # crawl, so the old `40 x sleep 1` was really anywhere from 43s to 60s
+        # of patience, and it kept expiring a few seconds before the session
+        # came up.
+        deadline=$(( t_start + WAIT_SECS ))
+        # The bar here is real: this phase is the slow one (lightdm restart, X,
+        # then the session) and the watcher is the thing timing it. Scaled
+        # against how long a healthy login actually takes, not the giving-up
+        # deadline, so it tracks reality instead of crawling to 100%.
+        EXPECT=25
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            session_active && break
+            el=$(( $(date +%s) - t_start ))
+            pct=$(( el * 100 / EXPECT ))
+            [ "$pct" -gt 99 ] && pct=99
+            say LOGIN "AUTHORISING" "$pct"
+            sleep 1
+        done
+        if session_active; then
+            say LOGIN "WELCOME" 100
+            # Deliberately NOT `systemctl restart cyberdeck-adb`. That script
+            # removes and re-adds the reverse tunnel and force-stops the viewer,
+            # which is the visible disconnect right after a tap. The tunnel
+            # survives a lightdm restart perfectly well on its own - only the VNC
+            # session needs picking back up, because x11vnc went with the old X.
+            # So: repair the tunnels only if they are actually missing, and nudge
+            # the viewer with the same intent it was started with.
+            adb_kali $ADB -s $SERIAL reverse --list | grep -q 'tcp:5900 tcp:5901' \
+                || adb_kali $ADB -s $SERIAL reverse tcp:5900 tcp:5901 >/dev/null 2>&1
+            adb_kali $ADB -s $SERIAL reverse --list | grep -q 'tcp:9000 tcp:9000' \
+                || adb_kali $ADB -s $SERIAL reverse tcp:9000 tcp:9000 >/dev/null 2>&1
+            # Reattach the viewer. A card login restarts lightdm, so X and with
+            # it x11vnc are new - the RFB session genuinely cannot survive that,
+            # and AVNC is left holding a dead socket.
+            #
+            # Try the gentle way first: re-send the same intent, which reconnects
+            # without the app visibly restarting. Measured, that alone does NOT
+            # always take - AVNC can sit on the dead connection - so verify, and
+            # only then fall back to the hard restart that always works. Best
+            # case you see no app restart at all; worst case you see what you
+            # saw before, instead of a viewer that never comes back.
+            viewer_up() { ss -tn state established 2>/dev/null | grep -q '127\.0\.0\.1:5901'; }
+            start_viewer() {
+                adb_kali $ADB -s $SERIAL shell am start \
+                    -a android.intent.action.VIEW \
+                    -d 'vnc://127.0.0.1:5900/?ViewOnly=false' \
+                    com.gaurav.avnc.debug >/dev/null 2>&1
+            }
+            start_viewer
+            i=0
+            while [ $i -lt 8 ]; do
+                viewer_up && break
+                sleep 1; i=$(( i + 1 ))
+            done
+            if viewer_up; then
+                log "logged in; viewer reattached, tunnel never dropped ($(( $(date +%s) - t_start ))s total)"
+            else
+                log "gentle reattach did not take - restarting the viewer"
+                adb_kali $ADB -s $SERIAL shell am force-stop com.gaurav.avnc.debug >/dev/null 2>&1
+                sleep 1
+                start_viewer
+                i=0
+                while [ $i -lt 10 ]; do
+                    viewer_up && break
+                    sleep 1; i=$(( i + 1 ))
+                done
+                log "logged in; viewer restarted, $(viewer_up && echo connected || echo STILL DOWN) ($(( $(date +%s) - t_start ))s total)"
+            fi
+        else
+            say BAD "LOGIN DID NOT COMPLETE"
+            log "login did not complete within $(( $(date +%s) - t_start ))s"
+        fi
+        rm -f "$TOKEN"
+        sleep 8
+    elif [ "$COUNT_BAD" -eq 1 ] && [ "$dt" -lt "$FAST" ]; then
+        bad=$(( bad + 1 ))
+        say BAD "CARD NOT RECOGNISED  $bad/$MAX_BAD"
+        log "card rejected ($bad/$MAX_BAD)"
+        if [ "$bad" -ge "$MAX_BAD" ]; then
+            date +%s > "$LOCK"
+            say LOCK "LOCKED OUT - PASSWORD ONLY"
+            log "$MAX_BAD rejected cards - forcing password for ${LOCK_SECS}s"
+        fi
+        sleep 2
+    else
+        # ran to its own timeout: no card was presented, so re-arm
+        armed=1
+        sleep 1
+    fi
+done

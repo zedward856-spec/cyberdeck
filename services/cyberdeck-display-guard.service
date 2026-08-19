@@ -1,0 +1,16 @@
+[Unit]
+Description=Cyberdeck display guard - if the Pi is up, the display is up
+After=cyberdeck-vnc.service cyberdeck-adb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cyberdeck-display-guard
+Restart=always
+RestartSec=2
+# the display outranks everything else on this box
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
+[Install]
+WantedBy=multi-user.target

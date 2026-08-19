@@ -1,0 +1,72 @@
+#!/bin/sh
+# Cyberdeck status signalling on the Pi's ACT LED.
+#
+# Normal state: the LED shows SD read/write activity (mmc0 trigger).
+# On the Kali desktop becoming ready it borrows the LED for a 3-breath sine
+# fade, then hands it straight back.
+#
+# The LED is binary (max_brightness=1), so the fade is software PWM at 250Hz
+# with gamma 2.2 - see cyberdeck-ledwave.c.
+set -u
+SERIAL=049a37d425226dff
+ADB=/usr/bin/adb
+POLL=4
+CYCLES=3
+PERIOD=2.0
+
+log() { logger -t cyberdeck-led -- "$1"; }
+# Ask the USB bus, not adb. This used to shell out to `adb get-state` every
+# POLL seconds; with the healthcheck doing the same, concurrent clients piled up
+# and wedged the adb server, taking the display down. sysfs costs nothing and
+# cannot block. The LED itself lives on the Pi, so adb is not needed here at all.
+adb_up() {
+    for d in /sys/bus/usb/devices/*/idVendor; do
+        [ -r "$d" ] || continue
+        [ "$(cat "$d" 2>/dev/null)" = "18d1" ] && return 0
+    done
+    return 1
+}
+
+monitor_active() {
+    [ -e /sys/class/net/wlan0mon ] && return 0
+    iw dev 2>/dev/null | grep -q 'type monitor' && return 0
+    return 1
+}
+desktop_ready() {
+    pgrep -u kali -x xfce4-session >/dev/null 2>&1 && return 0
+    loginctl list-sessions --no-legend 2>/dev/null \
+        | awk '$3=="kali" && $4=="seat0"' | grep -q . && return 0
+    return 1
+}
+want_state() {
+    if monitor_active; then echo monitor; return; fi
+    if desktop_ready;  then echo ready;   return; fi
+    if adb_up;         then echo linking; return; fi
+    echo boot
+}
+signal() { /usr/local/bin/cyberdeck-ledsignal "$CYCLES" "$PERIOD" >/dev/null 2>&1 & }
+
+case "${1:-daemon}" in
+    wave)  /usr/local/bin/cyberdeck-ledsignal "${2:-$CYCLES}" "${3:-$PERIOD}"; echo "done"; exit 0 ;;
+    state) want_state; exit 0 ;;
+    diag)  echo "state       : $(want_state)"
+           echo "ACT trigger : $(grep -o '\[[a-z0-9_-]*\]' /sys/class/leds/ACT/trigger)"
+           echo "adb         : $($ADB -s $SERIAL get-state 2>&1)"
+           echo "xfce4       : $(pgrep -u kali -x xfce4-session >/dev/null && echo running || echo no)"
+           exit 0 ;;
+esac
+
+prev=""
+while :; do
+    want=$(want_state)
+    if [ "$want" != "$prev" ]; then
+        log "state -> $want"
+        # setup complete: Kali desktop is up
+        if [ "$want" = ready ] && [ -n "$prev" ]; then
+            signal
+            log "ACT: setup-complete breath"
+        fi
+        prev=$want
+    fi
+    sleep "$POLL"
+done

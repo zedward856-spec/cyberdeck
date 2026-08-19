@@ -1,0 +1,35 @@
+#!/bin/sh
+
+set -u
+
+ADB=/usr/bin/adb
+NEXUS_SERIAL=049a37d425226dff
+
+while :; do
+    if ! "$ADB" -s "$NEXUS_SERIAL" wait-for-device; then
+        sleep 2
+        continue
+    fi
+
+    if "$ADB" -s "$NEXUS_SERIAL" get-state 2>/dev/null | grep -qx device; then
+        "$ADB" -s "$NEXUS_SERIAL" reverse --remove tcp:5900 >/dev/null 2>&1 || true
+        "$ADB" -s "$NEXUS_SERIAL" reverse tcp:5900 tcp:5901
+        "$ADB" -s "$NEXUS_SERIAL" forward --remove tcp:8765 >/dev/null 2>&1 || true
+        "$ADB" -s "$NEXUS_SERIAL" forward tcp:8765 tcp:8765
+        "$ADB" -s "$NEXUS_SERIAL" shell input keyevent 224 >/dev/null 2>&1 || true
+        "$ADB" -s "$NEXUS_SERIAL" shell settings put system accelerometer_rotation 0 >/dev/null 2>&1 || true
+        "$ADB" -s "$NEXUS_SERIAL" shell settings put system user_rotation 1 >/dev/null 2>&1 || true
+        "$ADB" -s "$NEXUS_SERIAL" shell pm grant com.gaurav.avnc.debug android.permission.CAMERA >/dev/null 2>&1 || true
+        "$ADB" -s "$NEXUS_SERIAL" shell am force-stop com.gaurav.avnc.debug >/dev/null 2>&1 || true
+        "$ADB" -s "$NEXUS_SERIAL" shell am start \
+            -a android.intent.action.VIEW \
+            -d vnc://127.0.0.1:5900/?ViewOnly=false \
+            com.gaurav.avnc.debug >/dev/null 2>&1 || true
+    fi
+
+    while "$ADB" -s "$NEXUS_SERIAL" get-state 2>/dev/null | grep -qx device; do
+        sleep 2
+    done
+
+    sleep 1
+done

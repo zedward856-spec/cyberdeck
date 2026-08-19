@@ -1,0 +1,14 @@
+[Unit]
+Description=Cyberdeck continuous NFC login watcher
+After=lightdm.service
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cyberdeck-nfc-watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

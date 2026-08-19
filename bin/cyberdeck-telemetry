@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""Cyberdeck telemetry endpoint for the phone launcher.
+
+Serves plain text on 127.0.0.1:9000. The phone reaches it through
+
+    adb reverse tcp:9000 tcp:9000
+
+so this never leaves the deck - it is bound to loopback and the only route in
+is the USB cable.
+
+Two things are published: the SoC temperature (read straight from sysfs, so
+asking for it does not itself spawn a process) and a rolling sample of newly
+started processes, which is what the launcher draws as its process stream.
+
+The client polls with ?since=<seq> and is only sent what it has not already
+seen. That matters: the launcher's speed graph measures loopback throughput,
+and shipping the whole buffer every two seconds would have registered as a
+couple of KB/s of phantom traffic in the very graph sitting underneath it.
+"""
+
+import os
+import re
+import subprocess
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+PORT = 9000
+KEEP = 64
+SCAN_S = 0.3          # process lifetimes are short; slower than this misses most
+MAX_LINE = 72
+
+_lock = threading.Lock()          # guards _log; do NOT shadow this name
+_log = deque(maxlen=KEEP)      # (seq, text)
+_seq = 0
+_self = os.getpid()
+
+_ws = re.compile(r"\s+")
+
+# The watchdog, LED and adb-link scripts are shell loops, so a raw stream is
+# nine tenths `sleep 1`. Those carry no information and crowd out the calls that
+# do, so they are the one thing dropped.
+_noise = re.compile(r"^(sleep [\d.]+|vcgencmd get_throttled)$")
+
+
+def _cmdline(pid):
+    """Compact command line, or None for kernel threads and dead pids."""
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    if not raw:
+        return None                                  # kernel thread
+    toks = []
+    for part in raw.split(b"\0"):
+        if not part:
+            continue
+        tok = _redact(part.decode("utf-8", "replace"))
+        if tok.startswith("/") and len(tok) > 1:     # /usr/bin/python3 -> python3
+            tok = tok.rsplit("/", 1)[-1] or tok
+        toks.append(tok)
+    if not toks:
+        return None
+    return _ws.sub(" ", " ".join(toks)).strip()[:MAX_LINE] or None
+
+
+def _watch():
+    """Sample /proc for pids that appeared since the last pass.
+
+    This is a sampler, not a tracer: a process that lives and dies inside one
+    interval is never seen. Catching every exec would mean the netlink process
+    connector and root, which is not worth it for a decorative stream.
+    """
+    global _seq
+    seen = set()
+    priming = True
+    while True:
+        try:
+            pids = set(int(p) for p in os.listdir("/proc") if p.isdigit())
+        except OSError:
+            time.sleep(SCAN_S)
+            continue
+        fresh = pids - seen
+        seen = pids
+        if priming:
+            priming = False        # do not dump everything already running
+        else:
+            for pid in sorted(fresh):
+                if pid == _self:
+                    continue
+                cmd = _cmdline(pid)
+                if not cmd or _noise.match(cmd):
+                    continue
+                with _lock:
+                    _seq += 1
+                    _log.append((_seq, cmd))
+        time.sleep(SCAN_S)
+
+
+def _raw_cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return " ".join(p.decode("utf-8", "replace") for p in raw.split(b"\0") if p)
+
+
+# `echo <pw> | sudo -S ...` and `sshpass -p <pw>` put a password in argv, where
+# anyone reading the panel across the room can see it. Strip before publishing.
+_secrets = [(re.compile(r"echo\s+\S+\s*\|\s*sudo", re.I), "sudo"),
+            (re.compile(r"(sshpass\s+-p)\s*\S+", re.I), r"\1 ***"),
+            (re.compile(r"(--password[= ])\S+", re.I), r"\1***")]
+
+
+def _redact(cmd):
+    for pat, sub in _secrets:
+        cmd = pat.sub(sub, cmd)
+    return cmd
+
+
+def _compact(cmd):
+    cmd = _redact(cmd)
+    toks = []
+    for tok in cmd.split(" "):
+        if tok.startswith("/") and len(tok) > 1:
+            tok = tok.rsplit("/", 1)[-1] or tok
+        toks.append(tok)
+    return _ws.sub(" ", " ".join(toks)).strip()[:56]
+
+
+# a login shell is the session, not a command anyone ran
+_shells = {"-bash", "-sh", "-zsh", "bash", "sh", "zsh", "-dash", "dash"}
+
+
+def _is_sshd(cmd):
+    # OpenSSH 9.8 split the per-session process out as "sshd-session:";
+    # matching only "sshd:" found nothing at all on this box.
+    return cmd.startswith("sshd:") or cmd.startswith("sshd-session:")
+
+
+def _ssh_scan():
+    """Sessions opened by sshd, and whatever is running underneath them."""
+    ppid, cmd = {}, {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return 0, []
+    for p in entries:
+        if not p.isdigit():
+            continue
+        pid = int(p)
+        c = _raw_cmdline(pid)
+        if c is None:
+            continue
+        try:
+            with open("/proc/%d/stat" % pid) as fh:
+                data = fh.read()
+            # comm can contain spaces and parens, so split on the LAST ')'
+            rest = data[data.rindex(")") + 2:].split()
+            ppid[pid] = int(rest[1])
+        except Exception:
+            continue
+        cmd[pid] = c
+
+    roots = set(pid for pid, c in cmd.items() if _is_sshd(c) and "@" in c)
+    if not roots:
+        return 0, []
+
+    kids = {}
+    for pid, par in ppid.items():
+        kids.setdefault(par, []).append(pid)
+
+    running, stack, seen = [], list(roots), set(roots)
+    while stack:
+        for k in kids.get(stack.pop(), ()):
+            if k in seen:
+                continue
+            seen.add(k)
+            stack.append(k)
+            c = cmd.get(k)
+            if not c or _is_sshd(c) or c in _shells:
+                continue
+            if _noise.match(c):
+                continue
+            running.append((k, _compact(c)))
+    running.sort()
+    return len(roots), [c for _, c in running]
+
+
+_ssh_lock = threading.Lock()
+_ssh = (0, 0, [])          # (version, sessions, commands)
+
+
+def _ssh_watch():
+    """Versioned so an unchanged panel costs nothing on the wire."""
+    global _ssh
+    while True:
+        try:
+            sessions, running = _ssh_scan()
+        except Exception:
+            sessions, running = 0, []
+        with _ssh_lock:
+            ver, old_s, old_r = _ssh
+            if (sessions, running) != (old_s, old_r):
+                _ssh = (ver + 1, sessions, running)
+        time.sleep(2.0)
+
+
+
+# --------------------------------------------------------------- screen lock
+
+_LOCK_CMD = "/usr/bin/xfce4-screensaver-command"
+_XDOTOOL  = "/usr/bin/xdotool"
+
+
+def _session_env():
+    """DISPLAY and friends belonging to the logged-in xfce session."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    want = ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
+    for p in entries:
+        if not p.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % p) as fh:
+                if fh.read().strip() != "xfce4-session":
+                    continue
+            with open("/proc/%s/environ" % p, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        env = {}
+        for kv in raw.split(b"\0"):
+            if b"=" not in kv:
+                continue
+            k, v = kv.decode("utf-8", "replace").split("=", 1)
+            if k in want:
+                env[k] = v
+        if "DISPLAY" in env:
+            return env
+    return None
+
+
+def _screen_lock():
+    """Lock the Kali desktop. Idempotent - locking a locked screen is a no-op.
+
+    loginctl lock-session looked like the tidy way to do this, but measured on
+    the deck it sets nothing: xfce4-screensaver does not act on logind's Lock
+    signal, so LockedHint stayed "no" and the screen stayed up. Driving the
+    screensaver directly is what actually locks.
+    """
+    env = _session_env()
+    if not env:
+        return "no session"                  # sitting at the greeter already
+    e = dict(os.environ)
+    e.update(env)
+    try:
+        rc = subprocess.call([_LOCK_CMD, "-l"], env=e, timeout=8,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        return "error %s" % exc
+    return "locked" if rc == 0 else "failed rc=%d" % rc
+
+
+def _wake():
+    """Bring the unlock prompt up on a locked screen.
+
+    Gated on the screensaver ACTUALLY being active, and it sends nothing that
+    can destroy anything.
+
+    The first version did neither, and it cost the user files. It fired
+    `space Home Delete` unconditionally, aimed at the password field. When the
+    screen was not locked there was no password field, so those keys went to
+    whatever had focus - the desktop - and Delete on a selected desktop icon
+    means "Move to Trash". It trashed the PN532 shortcut and then its folder,
+    forty minutes apart, before anyone noticed.
+
+    Lesson kept in code: never synthesise keystrokes at a display without first
+    confirming the thing you think is listening is actually there.
+    """
+    env = _session_env()
+    if not env:
+        return "no session"
+    e = dict(os.environ)
+    e.update(env)
+
+    try:
+        q = subprocess.check_output([_LOCK_CMD, "-q"], env=e, timeout=6,
+                                    stderr=subprocess.DEVNULL).decode().lower()
+    except Exception as exc:
+        return "state unknown (%s)" % exc
+    if "is active" not in q:
+        # Not locked: there is no prompt to raise, and anything typed here
+        # lands on the live desktop. Do nothing at all.
+        return "not locked"
+
+    try:
+        # Space only. It wakes the dialog and leaves one character in the
+        # password box, which does not matter - the card token is `sufficient`
+        # so the field is never read. Clearing it was cosmetic, and the keys
+        # used to clear it are exactly the ones that did the damage.
+        rc = subprocess.call([_XDOTOOL, "key", "--clearmodifiers", "space"],
+                             env=e, timeout=5,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        return "error %s" % exc
+    return "woken" if rc == 0 else "failed rc=%d" % rc
+
+
+
+# ------------------------------------------------------------- power health
+#
+# The 3B+ has no ADC on its 5V input, so the rail voltage genuinely cannot be
+# read - `measure_volts` reports core/SDRAM only. What the SoC DOES expose is
+# the undervoltage detector, which is the thing worth showing anyway.
+#
+#   bit 0  under-voltage right now
+#   bit 16 under-voltage has happened since boot
+
+_thr_lock = threading.Lock()
+_throttled = "unknown"
+
+# It is NOT in /usr/bin on this box - it is /usr/local/bin/vcgencmd. Hardcoding
+# the usual path made every poll raise FileNotFoundError, which the except
+# swallowed into a permanent "unknown".
+_VCGENCMD = None
+for _cand in ("/usr/local/bin/vcgencmd", "/usr/bin/vcgencmd", "/opt/vc/bin/vcgencmd"):
+    if os.path.exists(_cand):
+        _VCGENCMD = _cand
+        break
+
+
+def _throttle_watch():
+    global _throttled
+    while True:
+        # Test hook: lets the launcher's warning badge be exercised without
+        # actually browning out the Pi. Unset in normal operation.
+        fake = os.environ.get("CYBERDECK_FAKE_THROTTLED")
+        if fake:
+            val = fake
+        elif _VCGENCMD is None:
+            val = "unknown"
+        else:
+            try:
+                out = subprocess.check_output([_VCGENCMD, "get_throttled"],
+                                              stderr=subprocess.DEVNULL, timeout=5)
+                val = out.decode().strip().split("=", 1)[1]
+            except Exception:
+                val = "unknown"
+        with _thr_lock:
+            _throttled = val
+        time.sleep(5.0)
+
+
+# ------------------------------------------------------------- command log
+#
+# Fed by /usr/local/share/cyberdeck-cmdlog.sh, sourced from the interactive
+# shells. This is the only way to see a command like `pwd`: it is a shell
+# builtin, so it forks nothing and no /proc sampler or exec tracer can ever
+# observe it. The shell tells us instead.
+
+CMDLOG = "/dev/shm/cyberdeck-cmdlog"
+_cmd_lock = threading.Lock()
+_cmds = (0, 0, [])          # (version, total seen, last few)
+
+
+def _cmd_watch():
+    global _cmds
+    seen_total = 0
+    last = []
+    while True:
+        try:
+            with open(CMDLOG) as fh:
+                lines = [l.strip() for l in fh if l.strip()]
+        except OSError:
+            lines = []
+        tail = [_redact(l)[:56] for l in lines[-8:]]
+        if tail != last:
+            seen_total += 1
+            last = tail
+            with _cmd_lock:
+                ver = _cmds[0] + 1
+                _cmds = (ver, seen_total, tail)
+        time.sleep(0.4)
+
+
+def _temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as fh:
+            return int(fh.read().strip()) / 1000.0
+    except Exception:
+        return -1.0
+
+
+def _payload(since, sshv, cmdv):
+    try:
+        load = os.getloadavg()[0]
+    except Exception:
+        load = -1.0
+    try:
+        with open("/proc/uptime") as fh:
+            up = int(float(fh.read().split()[0]))
+    except Exception:
+        up = 0
+
+    with _lock:
+        seq = _seq
+        fresh = [t for (s, t) in _log if s > since]
+
+    with _ssh_lock:
+        sver, sessions, running = _ssh
+
+    out = ["SEQ %d" % seq,
+           "TEMP %.1f" % _temp(),
+           "LOAD %.2f" % load,
+           "UP %d:%02d" % (up // 3600, (up % 3600) // 60),
+           "SSHV %d" % sver,
+           "THROTTLED %s" % _throttled]
+
+    with _cmd_lock:
+        cver, ctotal, clines = _cmds
+    out.append("CMDV %d" % cver)
+    if cver != cmdv:
+        out.append("CMDT %d" % ctotal)
+        out += ["M " + c for c in clines]
+    if sver != sshv:                       # only ship the panel when it moved
+        out.append("SSHN %d" % sessions)
+        # true total, separate from the capped list - otherwise the panel's
+        # "+N more" counts only what fitted in the payload and under-reports
+        out.append("SSHC %d" % len(running))
+        out += ["S " + c for c in running[:6]]
+    out += ["L " + t for t in fresh]
+    return ("\n".join(out) + "\n").encode("utf-8")
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        route = urlparse(self.path).path
+        if route in ("/lock", "/wake"):
+            result = _screen_lock() if route == "/lock" else _wake()
+            body = (route[1:].upper() + " " + result + chr(10)).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        since, sshv, cmdv = 0, -1, -1
+        try:
+            q = parse_qs(urlparse(self.path).query)
+            since = int(q.get("since", ["0"])[0])
+            sshv = int(q.get("sshv", ["-1"])[0])
+            cmdv = int(q.get("cmdv", ["-1"])[0])
+        except Exception:
+            pass
+        body = _payload(since, sshv, cmdv)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass                        # a request every 2s does not belong in syslog
+
+
+if __name__ == "__main__":
+    threading.Thread(target=_watch, daemon=True).start()
+    threading.Thread(target=_ssh_watch, daemon=True).start()
+    threading.Thread(target=_throttle_watch, daemon=True).start()
+    threading.Thread(target=_cmd_watch, daemon=True).start()
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

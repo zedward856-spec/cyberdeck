@@ -1,0 +1,51 @@
+#!/bin/sh
+# Own the visuals of the locked screen.
+#
+# Two problems this solves, both introduced by moving from the greeter to an
+# autologin + lock-screen model:
+#
+# 1. THE BLACK SCREEN. xfce4-screensaver paints a black fullscreen window and
+#    only renders its wallpaper/dialog once something pokes it. Over VNC nothing
+#    ever pokes it, so the phone showed a dead black rectangle and the deck
+#    looked like it had failed to start. A pointer nudge makes it draw. Pointer
+#    ONLY - never synthetic keystrokes, which have destroyed desktop files here
+#    before by landing somewhere unintended.
+#
+# 2. THE MISSING NFC PANEL. cyberdeck-nfc-status was written for the greeter and
+#    destroys itself the moment a desktop session exists (session_up() in its
+#    tick()). Under autologin a session always exists, so it died on its first
+#    tick. CYBERDECK_PANEL_PERSIST skips that guard; this script owns its
+#    lifecycle instead - up while locked, gone once unlocked.
+#
+# Polling lives here rather than in the panel: a subprocess on the panel's 150ms
+# draw loop would be real load on a Pi already pinned at 1200MHz.
+
+PANEL=/usr/local/bin/cyberdeck-nfc-status
+# Bracketed so the pattern cannot match this script's own command line.
+PAT="cyberdeck-nfc-statu[s]"
+
+locked()  { xfce4-screensaver-command -q 2>/dev/null | grep -qi 'is active'; }
+running() { pgrep -u "$(id -u)" -f "$PAT" >/dev/null 2>&1; }
+
+nudge() {
+    # Two moves: one to wake the draw, one so the pointer is not parked on a
+    # hotspot. Harmless if the screensaver ignores it.
+    xdotool mousemove 960 540 2>/dev/null
+    sleep 1
+    xdotool mousemove 900 500 2>/dev/null
+}
+
+was_locked=0
+while :; do
+    if locked; then
+        if [ "$was_locked" -eq 0 ]; then
+            nudge                      # only on the transition, not every 2s
+            was_locked=1
+        fi
+        running || CYBERDECK_PANEL_PERSIST=1 setsid "$PANEL" >/dev/null 2>&1 &
+    else
+        was_locked=0
+        running && pkill -u "$(id -u)" -f "$PAT" >/dev/null 2>&1
+    fi
+    sleep 2
+done

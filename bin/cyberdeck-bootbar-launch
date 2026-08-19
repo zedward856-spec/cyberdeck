@@ -1,0 +1,10 @@
+#!/bin/sh
+# lightdm display-setup-script: runs as root when X comes up.
+# MUST return immediately or it blocks lightdm, so both are backgrounded.
+#
+# The NFC panel rides here rather than on greeter-setup-script: started from
+# there it ran but could never open the display, and drew nothing at all.
+[ -n "${DISPLAY:-}" ] || exit 0
+nohup /usr/local/bin/cyberdeck-bootbar >/run/cyberdeck-bootbar.log 2>&1 &
+nohup /usr/local/bin/cyberdeck-nfc-status >/run/cyberdeck-nfc-status.log 2>&1 &
+exit 0

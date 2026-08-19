@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""xsecurelock saver: the NFC scanning panel, drawn AS the lock screen.
+
+Written fresh rather than reusing cyberdeck-nfc-status. That panel was built for
+the lightdm greeter: it makes an override-redirect, -topmost toplevel and keeps
+re-raising itself. Under xsecurelock that fights the saver window instead of
+filling it, and the process exited within ~1.5s every time.
+
+The mechanism that matters: xsecurelock passes a window id in
+$XSCREENSAVER_WINDOW and expects the saver to draw INSIDE it. Tk supports
+exactly this natively via Tk(use=...), so there is no reparenting to race.
+
+Why a custom saver at all: xfce4-screensaver paints a fullscreen window and
+re-raises it on every visibility change, so nothing can be drawn over it -
+measured, a -topmost window raised every 50ms never became visible. Handing the
+lock screen to something that will show our content is the only way back.
+"""
+
+import os
+import sys
+import time
+import tkinter as tk
+
+STATE = "/run/cyberdeck-nfc/state"
+CARD  = "/run/cyberdeck-nfc/card"
+
+BG     = "#0d0f14"      # matches the wallpaper ground
+PANEL  = "#23252e"      # the old login-box body, kept for continuity
+DIM    = "#3d5468"
+KALI   = "#367bf0"
+OK     = "#5cc48d"
+BAD    = "#c9342f"
+WARN   = "#e0a445"
+
+COLOUR = {"SCAN": KALI, "READ": OK, "BAD": BAD, "LOCK": BAD,
+          "LOGIN": KALI, "WELCOME": OK}
+
+# Fall back cleanly: these are installed for the launcher, but a saver that
+# crashes on a missing font would leave a blank lock screen.
+def pick_font(root, *names):
+    try:
+        import tkinter.font as tkfont
+        have = set(tkfont.families(root))
+        for n in names:
+            if n in have:
+                return n
+    except Exception:
+        pass
+    return "DejaVu Sans Mono"
+
+
+def read_state():
+    try:
+        with open(STATE) as f:
+            parts = f.read().strip().split("|")
+        state = parts[0] if parts else "SCAN"
+        text  = parts[1] if len(parts) > 1 else ""
+        prog  = float(parts[2]) if len(parts) > 2 else -1.0
+        return state, text, prog
+    except Exception:
+        return "SCAN", "SCANNING FOR CARD", -1.0
+
+
+def reader_ok():
+    # The channel file only exists while cyberdeck-nfc-fast holds the PN532
+    # open. Its absence is exactly the "reader is unplugged" case, and saying so
+    # beats sweeping a bar forever at a dead reader.
+    return os.path.exists(CARD)
+
+
+class Saver:
+    def __init__(self, root, w, h):
+        self.root, self.w, self.h = root, w, h
+        self.phase = 0
+        self.c = tk.Canvas(root, width=w, height=h, bg=BG, highlightthickness=0)
+        self.c.pack(fill="both", expand=True)
+        # xsecurelock resizes the saver window to fullscreen AFTER handing it over,
+        # so the size read at startup is a small placeholder. Without this the
+        # panel renders in a ~200px box in the top-left corner.
+        self.c.bind("<Configure>", self.on_resize)
+        self.face = pick_font(root, "Corpta DEMO", "Chakra Petch", "DejaVu Sans")
+        self.mono = pick_font(root, "Chakra Petch", "DejaVu Sans Mono")
+        self.tick()
+
+    def on_resize(self, ev):
+        if ev.width > 100 and ev.height > 100:
+            self.w, self.h = ev.width, ev.height
+
+    def tick(self):
+        state, text, prog = read_state()
+        self.phase += 2
+        self.draw(state, text, prog)
+        self.root.after(120, self.tick)
+
+    def draw(self, state, text, prog):
+        c, w, h = self.c, self.w, self.h
+        c.delete("all")
+
+        pw, ph = min(760, int(w * 0.62)), 250
+        px, py = (w - pw) // 2, int(h * 0.42)
+
+        col = COLOUR.get(state, KALI)
+        live = reader_ok()
+        if not live:
+            col, text, state = WARN, "READER NOT RESPONDING", "BAD"
+
+        c.create_rectangle(px, py, px + pw, py + ph, fill=PANEL, outline=col, width=2)
+
+        # corner ticks, same language as the wallpaper frame
+        t = 26
+        for cx, cy, dx, dy in ((px, py, 1, 1), (px + pw, py, -1, 1),
+                               (px, py + ph, 1, -1), (px + pw, py + ph, -1, -1)):
+            c.create_line(cx, cy, cx + dx * t, cy, fill=col, width=3)
+            c.create_line(cx, cy, cx, cy + dy * t, fill=col, width=3)
+
+        c.create_text(px + pw // 2, py + 58, text=(text or state).upper(),
+                      fill=col, font=(self.face, 26))
+
+        bx0, bx1, by = px + 40, px + pw - 40, py + 120
+        c.create_rectangle(bx0, by, bx1, by + 18, outline=DIM)
+
+        if prog >= 0:
+            fill = bx0 + (bx1 - bx0) * max(0.0, min(1.0, prog / 100.0))
+            c.create_rectangle(bx0, by, fill, by + 18, fill=col, outline="")
+            c.create_text(bx1, by + 46, anchor="e", text="%d%%" % int(prog),
+                          fill=DIM, font=(self.mono, 14))
+        elif live:
+            span = (bx1 - bx0) * 0.22
+            pos = (self.phase % 100) / 100.0
+            a = bx0 + (bx1 - bx0 + span) * pos - span
+            c.create_rectangle(max(bx0, a), by, min(bx1, a + span), by + 18,
+                               fill=col, outline="")
+
+        sub = ("HOLD THE CARD ON THE READER" if (state == "SCAN" and live)
+               else ("CHECK THE PN532 WIRING - PASSWORD STILL WORKS" if not live else ""))
+        c.create_text(px + pw // 2, py + 178, text=sub, fill=DIM, font=(self.face, 14))
+        c.create_text(px + pw // 2, py + 212, text=time.strftime("%H:%M"),
+                      fill=DIM, font=(self.mono, 16))
+
+
+def main():
+    win = os.environ.get("XSCREENSAVER_WINDOW")
+    try:
+        if win:
+            # Tk embeds directly into the id xsecurelock gives us. It accepts
+            # decimal or 0x-prefixed hex; xsecurelock hands over decimal.
+            root = tk.Tk(use=win)
+        else:
+            root = tk.Tk()          # standalone, for testing outside the locker
+            root.attributes("-fullscreen", True)
+    except Exception as e:
+        sys.stderr.write("saver: cannot open display: %s\n" % e)
+        return 1
+
+    root.configure(bg=BG)
+    root.update_idletasks()
+    # Always take the SCREEN size, never the widget's. xsecurelock's saver
+    # window covers the display, but querying the freshly-embedded widget
+    # returns Tk's placeholder size and the panel then renders in a ~200px box
+    # in the top-left corner. No <Configure> arrives to correct it either,
+    # because the window was already sized before Tk attached to it.
+    w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+
+    Saver(root, w, h)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

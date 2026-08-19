@@ -1,0 +1,51 @@
+#!/bin/sh
+
+# Lock on the current X display, reveal the authentication panel, and begin
+# PAM once. A valid NFC key then completes authentication without a click.
+xset s off
+xset s noblank
+xset -dpms
+
+wallpaper=$(xfconf-query -c xfce4-desktop \
+  -p /backdrop/screen0/monitorHDMI-1/workspace0/last-image 2>/dev/null)
+wallpaper_dir="$HOME/.local/share/cyberdeck-lock-wallpaper"
+if [ -n "$wallpaper" ] && [ -f "$wallpaper" ]; then
+  mkdir -p "$wallpaper_dir"
+  ln -sfn "$wallpaper" "$wallpaper_dir/current.jpg"
+fi
+
+xfce4-screensaver-command --lock || exit 1
+
+(
+  runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+  exec 9>"$runtime_dir/cyberdeck-nfc-watch.lock"
+  flock -n 9 || exit 0
+
+  while [ "$(xfce4-screensaver-command --query 2>/dev/null | head -n 1)" = "The screensaver is active" ]; do
+    if /usr/local/libexec/cyberdeck-nfc-auth watch; then
+      attempt=0
+      while [ "$attempt" -lt 100 ]; do
+        dialog_pid=$(pgrep -u "$(id -u)" -f '^/usr/libexec/xfce4-screensaver-dialog( |$)' | head -n 1)
+        if [ -n "$dialog_pid" ] && xdotool search --onlyvisible --pid "$dialog_pid" >/dev/null 2>&1; then
+          xdotool key --clearmodifiers Return
+          break
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.02
+      done
+
+      attempt=0
+      while [ "$attempt" -lt 60 ]; do
+        if [ "$(xfce4-screensaver-command --query 2>/dev/null | head -n 1)" != "The screensaver is active" ]; then
+          exit 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.05
+      done
+    fi
+  done
+) >/dev/null 2>&1 &
+
+sleep 0.03
+xfce4-screensaver-command --poke || exit 1
+exit 0

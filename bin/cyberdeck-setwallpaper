@@ -1,0 +1,29 @@
+#!/bin/sh
+# Regenerate the cyberdeck wallpaper and actually make xfdesktop show it.
+#
+# xfdesktop caches the backdrop by PATH, so overwriting the same filename does
+# nothing - not even `xfdesktop --reload` picks it up. We therefore write a
+# fresh versioned file each time and repoint xfconf at the new path.
+set -eu
+DIR=/usr/local/share/backgrounds
+STAMP=$(date +%Y%m%d-%H%M%S)
+NEW="$DIR/cyberdeck-hud-$STAMP.png"
+
+/usr/local/bin/cyberdeck-mkwallpaper >/dev/null
+sudo -n mkdir -p "$DIR" 2>/dev/null || mkdir -p "$DIR"
+cp /tmp/cyberdeck-hud.png "$NEW" 2>/dev/null || sudo cp /tmp/cyberdeck-hud.png "$NEW"
+chmod 644 "$NEW" 2>/dev/null || sudo chmod 644 "$NEW"
+
+for p in $(xfconf-query -c xfce4-desktop -l | grep -E 'last-image|last-single-image|image-path'); do
+    xfconf-query -c xfce4-desktop -p "$p" -s "$NEW" 2>/dev/null || true
+done
+for p in $(xfconf-query -c xfce4-desktop -l | grep 'image-style'); do
+    xfconf-query -c xfce4-desktop -p "$p" -s 5 2>/dev/null || true
+done
+xfdesktop --reload 2>/dev/null || true
+
+# keep only the three most recent generations
+ls -1t "$DIR"/cyberdeck-hud-*.png 2>/dev/null | tail -n +4 | while read -r f; do
+    rm -f "$f" 2>/dev/null || sudo rm -f "$f"
+done
+echo "$NEW"

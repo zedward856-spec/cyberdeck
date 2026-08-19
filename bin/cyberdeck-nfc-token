@@ -1,0 +1,19 @@
+#!/bin/sh
+# PAM check for card-granted login/unlock. Never touches the reader - it only
+# asks whether the watcher saw a valid card recently.
+#
+# The token is deliberately NOT consumed on read. lightdm fires TWO concurrent
+# authentications for an autologin user; a single-use token let the first one
+# eat it, the second fail, and the seat tear the session down before the winner
+# finished. Validity is bounded by age instead, and the watcher deletes it once
+# the login has completed.
+set -u
+MAX_AGE=25
+
+[ -f "$TOKEN" ] || exit 1
+ts=$(cat "$TOKEN" 2>/dev/null)
+case "$ts" in ''|*[!0-9]*) exit 1 ;; esac
+age=$(( $(date +%s) - ts ))
+[ "$age" -ge 0 ] && [ "$age" -le "$MAX_AGE" ] || { rm -f "$TOKEN"; exit 1; }
+logger -t cyberdeck-nfc-token "accepted (age ${age}s)"
+exit 0

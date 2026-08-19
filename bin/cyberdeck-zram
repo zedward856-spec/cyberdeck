@@ -1,0 +1,24 @@
+#!/bin/sh
+# Compressed RAM swap. On a 1GB Pi this is the difference between
+# "tab closed itself" and "kept working".
+set -u
+DEV=/dev/zram0
+SIZE=512M
+case "${1:-start}" in
+start)
+    modprobe zram num_devices=1 2>/dev/null || true
+    i=0; while [ ! -b "$DEV" ] && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done
+    [ -b "$DEV" ] || { echo "zram0 never appeared" >&2; exit 1; }
+    swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$DEV" && exit 0
+    echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+    sleep 1
+    echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+    echo "$SIZE" > /sys/block/zram0/disksize
+    mkswap "$DEV" >/dev/null 2>&1
+    swapon -p 100 "$DEV"
+    ;;
+stop)
+    swapoff "$DEV" 2>/dev/null || true
+    echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+    ;;
+esac

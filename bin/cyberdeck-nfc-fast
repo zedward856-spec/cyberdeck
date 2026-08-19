@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Fast PN532 reader for the cyberdeck.
+
+The libnfc helper costs 3.7 SECONDS just to open the reader - measured with
+nfc-list - and the watcher was spawning a fresh one for every poll, so it paid
+that before it even looked for a card. This is the approach the PN532 desktop
+app on this machine already uses: hold the reader open over I2C and poll it.
+Measured here: 108ms to open, 17ms to configure, ~510ms per empty poll.
+
+It owns the reader exclusively. Nothing else may touch the bus while this runs,
+which is why the watcher stops calling the libnfc helper once this is live.
+
+    cyberdeck-nfc-fast --provision   learn the card currently on the reader
+    cyberdeck-nfc-fast               daemon: publish card state continuously
+
+Published to /run/cyberdeck-nfc/card, rewritten every poll:
+
+    NONE
+    VALID <uid-hex>
+    UNKNOWN <uid-hex>
+
+WHAT THIS CHECKS. It matches the card's UID against a provisioned salted hash.
+A UID is not a secret and can be cloned by anyone who can read the card, so this
+is a convenience credential, not a strong one - the same class of security as a
+door fob. The password fallback is untouched, and the original libnfc helper is
+left in place and still used when no fast credential is provisioned.
+"""
+
+import hashlib
+import os
+import secrets
+import sys
+import tempfile
+import time
+
+CRED = "/etc/cyberdeck-nfc/fast.bin"
+STATE = "/run/cyberdeck-nfc/card"
+MAGIC = b"CDKFAST1\0"
+# 0.2s, not 0.5s. This is the dominant term in tap-to-unlock: it bounds how
+# long a card can sit on the reader before anyone knows it is there. The cost is
+# only more I2C chatter on an otherwise idle bus.
+POLL_S = 0.2
+STALE_GRACE = 3          # polls a card may go missing before we call it gone
+
+
+def _load():
+    try:
+        with open(CRED, "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return None
+    if len(blob) != len(MAGIC) + 16 + 32 or not blob.startswith(MAGIC):
+        return None
+    body = blob[len(MAGIC):]
+    return body[:16], body[16:]
+
+
+def _digest(salt, uid):
+    return hashlib.sha256(salt + uid).digest()
+
+
+def _open_reader():
+    import board
+    import busio
+    from adafruit_pn532.i2c import PN532_I2C
+    i2c = busio.I2C(board.SCL, board.SDA)
+    pn = PN532_I2C(i2c, debug=False)
+    pn.firmware_version                      # raises if the reader is not there
+    pn.SAM_configuration()
+    return pn
+
+
+def _write_state(text):
+    """Atomic, so a reader never sees a half-written line."""
+    try:
+        os.makedirs("/run/cyberdeck-nfc", exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir="/run/cyberdeck-nfc")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text + "\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def provision():
+    pn = _open_reader()
+    sys.stderr.write("hold the card on the reader...\n")
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        uid = pn.read_passive_target(timeout=POLL_S)
+        if uid is None:
+            continue
+        salt = secrets.token_bytes(16)
+        os.makedirs(os.path.dirname(CRED), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CRED))
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(MAGIC + salt + _digest(salt, bytes(uid)))
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, CRED)
+        print("provisioned UID %s" % "".join("%02X" % b for b in uid))
+        return 0
+    sys.stderr.write("no card presented\n")
+    return 1
+
+
+def daemon():
+    cred = _load()
+    if cred is None:
+        # Nothing to check against: get out of the way so the watcher keeps
+        # using the libnfc helper rather than leaving the deck unable to log in.
+        sys.stderr.write("no fast credential at %s - not taking the reader\n" % CRED)
+        return 2
+    salt, want = cred
+
+    pn = _open_reader()
+    sys.stderr.write("reader open, polling every %.1fs\n" % POLL_S)
+    missing = 0
+    last = None
+    while True:
+        try:
+            uid = pn.read_passive_target(timeout=POLL_S)
+        except Exception:
+            time.sleep(1.0)
+            continue
+
+        if uid is None:
+            missing += 1
+            if missing >= STALE_GRACE and last != "NONE":
+                last = "NONE"
+                _write_state(last)
+            continue
+
+        missing = 0
+        uid = bytes(uid)
+        hexid = "".join("%02X" % b for b in uid)
+        ok = secrets.compare_digest(_digest(salt, uid), want)
+        line = ("VALID " if ok else "UNKNOWN ") + hexid
+        if line != last:
+            last = line
+            _write_state(line)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--provision":
+        sys.exit(provision())
+    sys.exit(daemon() or 0)

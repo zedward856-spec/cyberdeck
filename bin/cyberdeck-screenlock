@@ -1,0 +1,78 @@
+#!/bin/sh
+# Drop-in replacement for xfce4-screensaver-command, backed by xsecurelock.
+#
+# Why this exists: xfce4-screensaver paints a fullscreen window and re-raises it
+# on every visibility change, so the NFC panel could never be drawn over it -
+# measured, an override-redirect -topmost Tk window raised every 50ms never
+# became visible. That left the lock screen solid black, or at best bare
+# wallpaper, with no card state at all. xsecurelock hands its saver a window to
+# draw INTO, which is how cyberdeck-nfc-saver gets on screen.
+#
+# Same flag grammar as the command it replaces, so telemetry (/lock),
+# cyberdeck-nfc-watch and cyberdeck-boot-lock all work unchanged - only the
+# command NAME had to be repointed at this file.
+
+SAVER=/usr/local/bin/cyberdeck-nfc-saver
+
+running() { pgrep -x xsecurelock >/dev/null 2>&1; }
+
+# The lock screen must NEVER time out or blank. The session sets this once at
+# login via cyberdeck-no-blank, but anything can flip it afterwards, so
+# re-assert at every lock rather than trusting state set minutes or hours ago.
+no_blank() {
+    xset s off        2>/dev/null
+    xset s noblank    2>/dev/null
+    xset -dpms        2>/dev/null
+}
+
+case "${1:-}" in
+    -l|--lock|-a|--activate)
+        running && exit 0                      # idempotent, as the original is
+        no_blank
+        XSECURELOCK_SAVER="$SAVER" \
+        XSECURELOCK_BLANK_TIMEOUT=-1 \
+        XSECURELOCK_BLANK_DPMS_STATE=on \
+        XSECURELOCK_SAVER_STOP_ON_BLANK=0 \
+        XSECURELOCK_SHOW_HOSTNAME=0 \
+        XSECURELOCK_SHOW_USERNAME=0 \
+        XSECURELOCK_AUTH_BACKGROUND_COLOR="#23252e" \
+        XSECURELOCK_AUTH_FOREGROUND_COLOR="#367bf0" \
+        setsid xsecurelock >/dev/null 2>&1 &
+        # Confirm it really took, so callers get a truthful exit code rather
+        # than a 0 that only means "we launched something".
+        i=0
+        while [ "$i" -lt 40 ]; do
+            running && { no_blank; exit 0; }
+            sleep 0.25
+            i=$(( i + 1 ))
+        done
+        exit 1
+        ;;
+    -d|--deactivate)
+        for p in $(pgrep -x xsecurelock); do kill "$p" 2>/dev/null; done
+        i=0
+        while [ "$i" -lt 20 ]; do
+            running || { no_blank; exit 0; }
+            sleep 0.25
+            i=$(( i + 1 ))
+        done
+        exit 1
+        ;;
+    -q|--query)
+        # Wording matched to the original exactly: callers grep for "is active".
+        if running; then
+            echo "The screensaver is active"
+        else
+            echo "The screensaver is inactive"
+        fi
+        exit 0
+        ;;
+    --poke|-p)
+        no_blank
+        exit 0        # nothing else to poke - the saver draws unconditionally
+        ;;
+    *)
+        echo "usage: $(basename "$0") [-l|-d|-q|--poke]" >&2
+        exit 2
+        ;;
+esac

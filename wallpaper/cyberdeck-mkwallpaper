@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Generate the cyberdeck HUD wallpaper.
+
+Same palette and motifs as cyberdeck-bootbar, but deliberately low contrast:
+a wallpaper sits *under* icons and terminals, so the splash's bright cyan and
+magenta are dimmed and the top-left is kept clear for desktop icons.
+
+The fastfetch block is a snapshot baked in at generation time. Only stable
+facts are included - no uptime or used-memory, which would be permanently
+wrong on a static image. Re-run this after a kernel or package change.
+"""
+import os, subprocess
+from PIL import Image, ImageDraw, ImageFont
+
+W, H = 1920, 1080
+OUT = "/tmp/cyberdeck-hud.png"
+
+# Palette is the launcher's, verbatim, so the two screens are one system
+# rather than two that merely resemble each other. Measured before this change:
+# the wallpaper's field read #070c11 against the launcher's #05080c, because
+# the scanlines sat ABOVE the base colour and lifted it - switching between the
+# desktop and the launcher visibly changed the black.
+LAUNCHER_BG      = (5, 8, 12)        # #05080c
+LAUNCHER_GRID    = (11, 18, 25)      # #0b1219
+LAUNCHER_KALI    = (54, 123, 240)    # #367bf0
+LAUNCHER_CYAN    = (34, 211, 238)    # #22d3ee
+LAUNCHER_MAGENTA = (255, 46, 136)    # #ff2e88
+LAUNCHER_GREEN   = (57, 232, 138)    # #39e88a
+LAUNCHER_AMBER   = (255, 176, 32)    # #ffb020
+LAUNCHER_RED     = (255, 59, 84)     # #ff3b54
+LAUNCHER_DIM     = (61, 84, 104)     # #3d5468
+
+
+def dim(c, k):
+    """A wallpaper sits under icons and terminals, so accents are damped -
+    but damped from the launcher's exact hues, not re-picked by eye."""
+    return (int(c[0] * k), int(c[1] * k), int(c[2] * k))
+
+
+BG        = LAUNCHER_BG
+GRID      = LAUNCHER_GRID
+# Scanlines now sit just BELOW the base instead of above it, so the mean field
+# stays at the launcher's #05080c while the texture is still there.
+SCAN      = (4, 6, 10)
+CYAN_DIM  = dim(LAUNCHER_CYAN, 0.42)
+MAG_DIM   = dim(LAUNCHER_MAGENTA, 0.37)
+KALI      = LAUNCHER_KALI
+KALI_DIM  = dim(LAUNCHER_KALI, 0.42)
+LOGO      = (42, 88, 156)
+KEY       = (48, 100, 182)
+VAL       = LAUNCHER_DIM
+TEXT_DIM  = dim(LAUNCHER_DIM, 0.72)
+WORD      = (44, 74, 104)
+
+F = "/usr/share/fonts/truetype/dejavu/"
+CORPTA  = "/usr/local/share/fonts/cyberdeck/CorptaDEMO.otf"
+# Scaled to match the desktop now running at GTK WindowScalingFactor=2.
+# Everything doubles except the wordmark: at 164px "CYBERDECK" is wider than
+# the canvas, so it takes 150 and still nearly spans the lower right.
+f_word  = ImageFont.truetype(CORPTA, 150)
+f_mono  = ImageFont.truetype(F + "DejaVuSansMono.ttf", 34)
+f_small = ImageFont.truetype(F + "DejaVuSansMono-Bold.ttf", 38)
+f_logo  = ImageFont.truetype(F + "DejaVuSansMono.ttf", 13)
+f_key   = ImageFont.truetype(CORPTA, 36)
+f_user  = ImageFont.truetype(F + "DejaVuSansMono-Bold.ttf", 30)
+f_label = ImageFont.truetype(CORPTA, 42)
+f_val   = ImageFont.truetype(F + "DejaVuSansMono.ttf", 30)
+
+KALI_LOGO = r"""
+..............
+            ..,;:ccc,.
+          ......''';lxO.
+.....''''..........,:ld;
+           .';;;:::;,,.x,
+      ..'''.            0Xxoc:,.  ...
+  ....                ,ONkc;,;cokOdc',.
+ .                   OMo           ':ddo.
+                    dMc               :OO;
+                    0M.                 .:o.
+                    ;Wd
+                     ;XO,
+                       ,d0Odlc;,..
+                           ..',;:cdOOd::,.
+                                    .:d;.':;.
+                                       'd,  .'
+                                         ;l   ..
+                                          .o
+                                            c
+                                            .'
+                                             .
+"""
+
+
+def sh(cmd, default="?"):
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True,
+                                       stderr=subprocess.DEVNULL).strip() or default
+    except Exception:
+        return default
+
+
+def read(p, d=""):
+    try:
+        return open(p).read().strip("\x00 \n")
+    except Exception:
+        return d
+
+
+def facts():
+    pretty = "Kali GNU/Linux"
+    for line in read("/etc/os-release").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            pretty = line.split("=", 1)[1].strip('"')
+    mem_kb = 0
+    for line in read("/proc/meminfo").splitlines():
+        if line.startswith("MemTotal:"):
+            mem_kb = int(line.split()[1])
+    cores = sh("nproc", "4")
+    mhz = sh("cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "0")
+    try:
+        ghz = "%.2fGHz" % (int(mhz) / 1e6)
+    except Exception:
+        ghz = "?"
+    cpu = "BCM2837 (%s) @ %s" % (cores, ghz)
+    return [
+        ("OS",      "%s %s" % (pretty, os.uname().machine)),
+        ("Host",    read("/proc/device-tree/model", "Raspberry Pi")),
+        ("Kernel",  os.uname().release),
+        ("Packages", sh("dpkg-query -f '.\\n' -W 2>/dev/null | wc -l", "?") + " (dpkg)"),
+        ("Shell",   sh("zsh --version 2>/dev/null | cut -d' ' -f1,2", "zsh")),
+        ("Display", "1920x1080  (Nexus 5 / VNC)"),
+        ("DE",      sh("xfce4-session --version 2>/dev/null | head -1 | cut -d' ' -f1,2", "Xfce")),
+        ("WM",      "Xfwm4"),
+        ("CPU",     cpu),
+        ("Memory",  "%d MiB" % (mem_kb // 1024)),
+        ("Swap",    "512 MiB (zram lz4)"),
+    ]
+
+
+img = Image.new("RGB", (W, H), BG)
+
+# ---- soft blue glow, built small and upscaled so it stays smooth ----
+gw, gh = 96, 54
+glow = Image.new("RGB", (gw, gh), BG)
+gp = glow.load()
+cxg, cyg = gw * 0.62, gh * 0.52
+maxd = (gw ** 2 + gh ** 2) ** 0.5
+for y in range(gh):
+    for x in range(gw):
+        dd = ((x - cxg) ** 2 + (y - cyg) ** 2) ** 0.5 / maxd
+        k = max(0.0, 1.0 - dd * 2.1) ** 2
+        gp[x, y] = (int(BG[0] + 14 * k), int(BG[1] + 30 * k), int(BG[2] + 58 * k))
+img = glow.resize((W, H), Image.BICUBIC)
+d = ImageDraw.Draw(img)
+
+# ---- grid ----
+for x in range(0, W, 128):
+    d.line([(x, 0), (x, H)], fill=GRID)
+for y in range(0, H, 128):
+    d.line([(0, y), (W, y)], fill=GRID)
+
+# ---- faint concentric rings, right of centre ----
+rcx, rcy = int(W * 0.70), int(H * 0.46)
+for r in (170, 250, 330, 430):
+    d.ellipse([rcx - r, rcy - r, rcx + r, rcy + r], outline=(12, 22, 34), width=2)
+d.arc([rcx - 330, rcy - 330, rcx + 330, rcy + 330], 205, 335, fill=KALI_DIM, width=3)
+d.arc([rcx - 430, rcy - 430, rcx + 430, rcy + 430], 20, 95, fill=(20, 60, 70), width=2)
+
+# ---- HUD corner brackets ----
+m, L = 54, 192
+# The panel is 56px tall now that the desktop runs at 2x, and the top brackets
+# sat at y=54 - their horizontal arms were hidden behind it entirely. The top
+# pair gets its own margin; the bottom pair has nothing above it to clear.
+mt = 96
+for ax, ay, dx, dy in ((m, mt, 1, 1), (W - m, mt, -1, 1),
+                       (m, H - m, 1, -1), (W - m, H - m, -1, -1)):
+    d.line([(ax, ay), (ax + dx * L, ay)], fill=CYAN_DIM, width=6)
+    d.line([(ax, ay), (ax, ay + dy * L)], fill=CYAN_DIM, width=6)
+    d.line([(ax + dx * 28, ay + dy * 56), (ax + dx * 28, ay + dy * 124)],
+           fill=MAG_DIM, width=4)
+
+# ---- top-right identity block ----
+node = read("/etc/hostname", "cyberdeck")
+mid = read("/etc/machine-id", "00000000")[:8].upper()
+d.text((W - m - 46, mt + 34), "KALI ARM", font=f_label, fill=(120, 26, 66), anchor="ra")
+d.text((W - m - 46, mt + 104), "NODE %s   ID %s" % (node, mid),
+       font=f_mono, fill=TEXT_DIM, anchor="ra")
+d.text((W - m - 46, mt + 154), "KERNEL %s" % os.uname().release,
+       font=f_mono, fill=TEXT_DIM, anchor="ra")
+
+# ---- fastfetch block ----
+#
+# The ASCII Kali logo is dropped at this scale. Doubling it made a 630px-tall,
+# 780px-wide block that pushed the facts off the bottom of the canvas; the
+# facts are the part worth reading, so they get the room.
+ix, iy, ih = m + 20, 250, 46
+d.text((ix, iy - 62), "kali@%s" % node, font=f_user, fill=KALI)
+d.line([(ix, iy - 22), (ix + 600, iy - 22)], fill=KALI_DIM, width=2)
+for i, (k, v) in enumerate(facts()):
+    y = iy + i * ih
+    d.text((ix, y), k, font=f_key, fill=KEY)
+    d.text((ix + 250, y), str(v), font=f_val, fill=VAL)
+
+# fastfetch-style colour swatches - the launcher's palette, as a legend
+sw_y = iy + len(facts()) * ih + 26
+for i, col in enumerate([dim(LAUNCHER_DIM, 0.55), KALI_DIM, CYAN_DIM,
+                         dim(LAUNCHER_GREEN, 0.55), dim(LAUNCHER_AMBER, 0.55),
+                         dim(LAUNCHER_RED, 0.55), MAG_DIM, LAUNCHER_DIM]):
+    d.rectangle([ix + i * 62, sw_y, ix + i * 62 + 46, sw_y + 28], fill=col)
+
+# ---- segmented bar motif ----
+bx, by, bw, bh = m + 20, H - m - 120, 1140, 30
+segs, gap = 40, 6
+swid = (bw - gap * (segs - 1)) / segs
+for i in range(segs):
+    x0 = bx + i * (swid + gap)
+    col = KALI_DIM if i < 26 else (16, 26, 36)
+    if i == 26:
+        col = (30, 74, 132)
+    d.rectangle([x0, by, x0 + swid, by + bh], fill=col)
+d.line([(bx - 26, by), (bx - 26, by + bh)], fill=CYAN_DIM, width=6)
+d.text((bx, by - 62), "SYS NOMINAL", font=f_label, fill=TEXT_DIM)
+
+# ---- kali dragon, sitting on top of the wordmark ----
+#
+# kali-logo-container.png is a filled panel with the dragon knocked OUT of it -
+# measured, its alpha is 92% opaque. Masking with that alpha directly paints
+# the panel and leaves the dragon as a hole, which is exactly what it did on
+# the first attempt. Inverting the alpha turns the hole into the shape.
+#
+# Recoloured to the wordmark's own tone so the two read as one mark.
+try:
+    from PIL import ImageChops
+    _src = Image.open(
+        "/usr/share/plymouth/themes/kali/kali-logo-container.png").convert("RGBA")
+    _a = ImageChops.invert(_src.split()[3])
+    _bb = _a.getbbox()
+    if _bb:
+        _a = _a.crop(_bb)
+    _lw = 300
+    _a = _a.resize((_lw, max(1, int(_a.height * _lw / _a.width))), Image.LANCZOS)
+    _tint = Image.new("RGBA", _a.size, WORD + (255,))
+    _tint.putalpha(_a)
+    _wm_right = W - m - 46
+    _wm_left = _wm_right - 970                # the wordmark's span at 150px
+    _cx = (_wm_left + _wm_right) // 2
+    img.paste(_tint, (_cx - _a.width // 2,
+                      H - m - 320 - _a.height - 10), _tint)
+except Exception:
+    pass
+
+# ---- wordmark ----
+d.text((W - m - 46, H - m - 320), "CYBERDECK", font=f_word, fill=WORD, anchor="ra")
+d.line([(W - m - 46 - 940, H - m - 62), (W - m - 46, H - m - 62)], fill=KALI, width=4)
+
+# ---- scanlines last ----
+for y in range(0, H, 4):
+    d.line([(0, y), (W, y)], fill=SCAN)
+
+img.save(OUT)
+print("wrote", OUT, img.size)

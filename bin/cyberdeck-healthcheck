@@ -1,0 +1,80 @@
+#!/bin/sh
+# Cyberdeck display-chain watchdog.
+# Walks the chain Pi -> x11vnc -> adb reverse -> AVNC session and restarts the
+# first broken link it finds. One repair per run, with a cooldown so a genuinely
+# unplugged phone or a powered-down screen can't cause a restart storm.
+set -u
+
+SERIAL=049a37d425226dff
+ADB=/usr/bin/adb
+STAMP=/run/cyberdeck-healthcheck.last
+COOLDOWN=120
+
+log() { logger -t cyberdeck-healthcheck -- "$1"; }
+# every adb call is time-boxed: a hung one used to linger for minutes and
+# block every other client of the adb server
+as_kali() { timeout 8 runuser -u kali -- env HOME=/home/kali "$@" 2>/dev/null; }
+
+phone_on_usb() {
+    for d in /sys/bus/usb/devices/*/idVendor; do
+        [ -r "$d" ] || continue
+        [ "$(cat "$d" 2>/dev/null)" = "18d1" ] && return 0
+    done
+    return 1
+}
+
+now=$(date +%s)
+
+# Let the box finish booting before intervening.
+[ "$(cut -d. -f1 /proc/uptime)" -lt 90 ] && exit 0
+
+if [ -f "$STAMP" ]; then
+    last=$(cat "$STAMP" 2>/dev/null || echo 0)
+    [ $(( now - last )) -lt "$COOLDOWN" ] && exit 0
+fi
+
+repair() {
+    log "$1 -> restarting $2"
+    echo "$now" > "$STAMP"
+    systemctl restart "$2"
+    exit 0
+}
+
+# 1. X server must be up, or nothing downstream can work.
+systemctl is-active --quiet lightdm \
+    || repair "lightdm inactive" lightdm
+
+# 2. x11vnc must be listening on the port AVNC targets.
+ss -lnt 2>/dev/null | grep -q '127\.0\.0\.1:5901' \
+    || repair "x11vnc not listening on 5901" cyberdeck-vnc
+
+# 2b. Listening is NOT the same as working. x11vnc can wedge while still bound:
+# connections complete the TCP handshake into its accept backlog and are never
+# accepted, so the port looks perfectly healthy while the screen is dead. That
+# is exactly what happened - Recv-Q had reached 33 and the viewer sat forever on
+# "connecting". A LISTEN socket with a persistently non-empty accept queue is
+# the tell.
+q=$(ss -lnt 2>/dev/null | awk '/127\.0\.0\.1:5901/{print $2; exit}')
+case "$q" in ''|*[!0-9]*) q=0 ;; esac
+[ "$q" -ge 4 ] && repair "x11vnc accept queue stuck at $q - listening but not accepting" cyberdeck-vnc
+
+# 3. Phone attached? Ask the USB bus - free, and it cannot hang.
+phone_on_usb || exit 0
+
+# 4. The reverse tunnel the viewer rides on.
+as_kali $ADB -s $SERIAL reverse --list | grep -q 'tcp:5900 tcp:5901' \
+    || repair "adb reverse tunnel missing" cyberdeck-adb
+
+# 4b. Telemetry tunnel behind the launcher's temp readout and process stream.
+# Losing it costs cosmetics, not the display, so re-add it in place rather than
+# spending the one repair per run on restarting a link that is working.
+if ! as_kali $ADB -s $SERIAL reverse --list | grep -q 'tcp:9000 tcp:9000'; then
+    as_kali $ADB -s $SERIAL reverse tcp:9000 tcp:9000 >/dev/null 2>&1 \
+        && log "telemetry tunnel re-added"
+fi
+
+# 5. Viewer actually holding the session open.
+ss -tn state established 2>/dev/null | grep -q '127\.0\.0\.1:5901' \
+    || repair "no established VNC session" cyberdeck-adb
+
+exit 0

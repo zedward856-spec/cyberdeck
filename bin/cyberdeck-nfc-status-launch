@@ -1,0 +1,6 @@
+#!/bin/sh
+# lightdm greeter-setup-script: runs as root once the greeter's X is up.
+# MUST return immediately or it blocks lightdm, so the panel is backgrounded.
+[ -n "${DISPLAY:-}" ] || exit 0
+nohup /usr/local/bin/cyberdeck-nfc-status >/run/cyberdeck-nfc-status.log 2>&1 &
+exit 0

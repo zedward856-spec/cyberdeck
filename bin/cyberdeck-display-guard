@@ -1,0 +1,80 @@
+#!/bin/sh
+# If the Pi is up, the display is up. That is this script's only job.
+#
+# The 30s healthcheck was too coarse for it: a lightdm restart takes X and
+# x11vnc with it, and the phone could sit on a dead session for half a minute.
+# This watches the same chain every 2 seconds and puts it back.
+#
+# The happy path costs two `ss` reads and a sysfs scan - no adb, no processes -
+# so running it this often is nearly free. adb is only touched when something is
+# actually broken.
+set -u
+
+ADB=/usr/bin/adb
+SERIAL=049a37d425226dff
+URI='vnc://127.0.0.1:5900/?ViewOnly=false'
+PKG=com.gaurav.avnc.debug
+
+log() { logger -t cyberdeck-display-guard -- "$1"; }
+adb_kali() { timeout 10 runuser -u kali -- env HOME=/home/kali "$@" 2>/dev/null; }
+
+listening()   { ss -lnt 2>/dev/null | grep -q '127\.0\.0\.1:5901'; }
+established() { ss -tn state established 2>/dev/null | grep -q '127\.0\.0\.1:5901'; }
+
+phone_on_usb() {
+    for d in /sys/bus/usb/devices/*/idVendor; do
+        [ -r "$d" ] || continue
+        [ "$(cat "$d" 2>/dev/null)" = "18d1" ] && return 0
+    done
+    return 1
+}
+
+start_viewer() {
+    adb_kali $ADB -s $SERIAL shell am start -a android.intent.action.VIEW \
+        -d "$URI" "$PKG" >/dev/null 2>&1
+}
+
+down=0
+log "guard up - display is first priority"
+
+while :; do
+    # No phone attached: nothing to keep alive, and hammering adb would only
+    # wedge the server. Wait for it.
+    phone_on_usb || { sleep 3; continue; }
+
+    if ! listening; then
+        log "x11vnc not listening - restarting cyberdeck-vnc"
+        systemctl restart cyberdeck-vnc
+        sleep 4
+        continue
+    fi
+
+    if established; then
+        [ "$down" -ne 0 ] && log "display back up"
+        down=0
+        sleep 2
+        continue
+    fi
+
+    down=$(( down + 1 ))
+
+    # The tunnel the viewer rides on. Re-add in place; never remove-and-re-add,
+    # which is what used to drop a working session.
+    adb_kali $ADB -s $SERIAL reverse --list | grep -q 'tcp:5900 tcp:5901' \
+        || { adb_kali $ADB -s $SERIAL reverse tcp:5900 tcp:5901 >/dev/null 2>&1
+             log "reverse tunnel re-added"; }
+
+    if [ "$down" -le 3 ]; then
+        # Gentle: re-send the intent. Usually enough, and the app does not blink.
+        start_viewer
+    else
+        # AVNC can sit holding a dead socket after X restarts. Then it needs the
+        # hard restart - but only after the gentle way has genuinely failed.
+        log "viewer not reattaching after $down tries - restarting it"
+        adb_kali $ADB -s $SERIAL shell am force-stop "$PKG" >/dev/null 2>&1
+        sleep 1
+        start_viewer
+        down=0
+    fi
+    sleep 2
+done
