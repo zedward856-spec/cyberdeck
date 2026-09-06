@@ -20,3 +20,6 @@ esp-dashboard/build/*.map
 
 # cardputer local secrets (WiFi pass + control token)
 cardputer-control/config.h
+
+# esp8266 dashboard control token
+esp-dashboard/deckdash_config.h
