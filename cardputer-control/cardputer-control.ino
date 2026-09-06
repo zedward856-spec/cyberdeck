@@ -236,6 +236,10 @@ void handleKeys() {
 void setup() {
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
+  Serial.begin(115200);
+  delay(200);
+  Serial.printf("\n[deck] boot; target SSID='%s' pass_len=%d host=%s\n",
+                WIFI_SSID, (int)strlen(WIFI_PASS), PI_HOST);
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.fillScreen(C_BG);
   cv = new M5Canvas(&M5Cardputer.Display);
