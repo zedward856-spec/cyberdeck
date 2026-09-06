@@ -1,0 +1,12 @@
+<?xml version="1.0" standalone='no'?>
+<!-- Install to /etc/avahi/services/cyberdeck.service  (root:root, 0644).
+     Makes avahi advertise the telemetry endpoint as _cyberdeck._tcp:9000 so the
+     ESP8266 dashboard can discover the deck without knowing its (dynamic) IP. -->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">Cyberdeck on %h</name>
+  <service>
+    <type>_cyberdeck._tcp</type>
+    <port>9000</port>
+  </service>
+</service-group>

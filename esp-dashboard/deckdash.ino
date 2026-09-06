@@ -15,12 +15,17 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
+#include <ESP8266mDNS.h>
 #include <WiFiManager.h>
 #include <U8g2lib.h>
 #include <Wire.h>
 #include "kali_logo.h"
 
-char teleUrl[96] = "http://192.168.0.29:9000/";
+// The deck moves between networks and gets a dynamic IP on a hotspot, so find it
+// by mDNS name instead of a fixed address. Manual URL override still available.
+char piHost[40] = "kali-raspberrypi";   // deck hostname (mDNS)
+char teleUrl[96] = "";                    // optional manual full URL; blank = use mDNS
+String gUrl = "";                         // resolved telemetry URL currently in use
 U8G2_SH1106_128X64_NONAME_F_SW_I2C *oled = nullptr;
 int SDAp = -1, SCLp = -1;
 
@@ -84,16 +89,37 @@ String field(const String &body, const char *key) {
   int e = body.indexOf('\n', p); if (e < 0) e = body.length();
   String v = body.substring(p, e); v.trim(); return v;
 }
+// Find the deck: manual override wins, else discover it via mDNS service query.
+// The Pi advertises _cyberdeck._tcp on port 9000 (avahi), so we don't need its
+// (dynamic) IP or even its hostname - just the service.
+bool resolveUrl() {
+  if (teleUrl[0]) { gUrl = teleUrl; return true; }
+  if (WiFi.status() != WL_CONNECTED) return false;
+  static bool mdnsUp = false;
+  if (!mdnsUp) mdnsUp = MDNS.begin("deckdash");
+  if (!mdnsUp) return false;
+  uint32_t n = MDNS.queryService("cyberdeck", "tcp");   // blocks briefly, returns count
+  if (n > 0) {
+    IPAddress ip = MDNS.answerIP(0);
+    uint16_t  port = MDNS.answerPort(0);
+    if ((uint32_t)ip != 0) {
+      gUrl = "http://" + ip.toString() + ":" + String(port ? port : 9000) + "/";
+      return true;
+    }
+  }
+  return false;
+}
 void fetch() {
   gOk = false;
   if (WiFi.status() != WL_CONNECTED) return;   // offline: no blocking, keep last data
+  if (gUrl == "" && !resolveUrl()) return;     // no deck address yet
   String body;
   WiFiClient client; HTTPClient http; http.setTimeout(1500);
-  if (http.begin(client, teleUrl)) {
+  if (http.begin(client, gUrl)) {
     if (http.GET() == 200) { body = http.getString(); gOk = true; }
     http.end();
   }
-  if (!gOk) return;
+  if (!gOk) { gUrl = ""; return; }             // lost it: re-resolve next cycle
   gTemp = field(body, "TEMP "); if (gTemp == "") gTemp = "--";
   gUp   = field(body, "UP ").toInt();
   gEpoch= field(body, "EPOCH ").toInt();
@@ -147,7 +173,7 @@ void drawBody() {
       oled->setFont(u8g2_font_5x7_tf);
       snprintf(line,sizeof(line),"ESP up %lus  heap %d", millis()/1000, ESP.getFreeHeap());
       oled->drawStr(0,52,line);
-      oled->drawStr(0,62, teleUrl);
+      oled->drawStr(0,62, gUrl.length() ? gUrl.c_str() : piHost);
     }
   }
   else if (page == 1) {                         // ---- SYSTEM ----
@@ -254,11 +280,15 @@ bool bootSplash() {
 void startPortal() {
   splash("WiFi setup", "join DeckDash-Setup");
   WiFiManager wm;
-  WiFiManagerParameter pUrl("url", "Pi telemetry URL", teleUrl, sizeof(teleUrl)-1);
+  WiFiManagerParameter pHost("host", "Pi mDNS name", piHost, sizeof(piHost)-1);
+  WiFiManagerParameter pUrl("url", "Manual URL (blank=use mDNS)", teleUrl, sizeof(teleUrl)-1);
+  wm.addParameter(&pHost);
   wm.addParameter(&pUrl);
   wm.setConfigPortalTimeout(180);
   wm.startConfigPortal("DeckDash-Setup");
+  strncpy(piHost, pHost.getValue(), sizeof(piHost)-1);
   strncpy(teleUrl, pUrl.getValue(), sizeof(teleUrl)-1);
+  gUrl = "";                                   // re-resolve with the new settings
 }
 
 void setup() {
@@ -281,6 +311,7 @@ void setup() {
 
 void loop() {
   bool changed = false;
+  MDNS.update();                               // pump LEAmDNS
   if (fell(PIN_LEFT,  sL)) { page = (page + NPAGES - 1) % NPAGES; playTransition(); }
   if (fell(PIN_RIGHT, sR)) { page = (page + 1) % NPAGES;         playTransition(); }
   if (fell(PIN_DOWN,  sD)) {                    // tap = refresh, hold ~1.5s = wifi setup

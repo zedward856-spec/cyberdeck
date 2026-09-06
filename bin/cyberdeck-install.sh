@@ -28,8 +28,14 @@ pkill -f 'python3.*cyberdeck-control' 2>/dev/null || true
 sudo systemctl daemon-reload
 sudo systemctl enable --now cyberdeck-control
 
-echo "[5/6] make the deck AP the boot default (home WiFi stays as fallback)"
-nmcli con modify cyberdeck-ap connection.autoconnect yes connection.autoconnect-priority 20
+echo "[5b] advertise telemetry over mDNS (_cyberdeck._tcp) for the ESP8266"
+sudo install -m644 "$REPO/services/cyberdeck.avahi-service" /etc/avahi/services/cyberdeck.service
+sudo systemctl reload avahi-daemon 2>/dev/null || sudo systemctl restart avahi-daemon
+
+echo "[5/6] keep the self-hosted AP as a manual fallback (not the boot default)"
+# Default network is a hotspot/home WiFi you join normally; the AP is on-demand
+# via 'cyberdeck-net ap'. Leave its autoconnect off so it doesn't fight the default.
+nmcli con modify cyberdeck-ap connection.autoconnect no 2>/dev/null || true
 
 echo "[6/6] status"
 systemctl is-active cyberdeck-control && echo "control service: active"
