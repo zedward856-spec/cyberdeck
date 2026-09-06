@@ -1,0 +1,51 @@
+#!/bin/sh
+# cyberdeck-net - switch the deck's built-in radio between hosting its own AP
+# (the 'cyberdeck' network the Cardputer/ESP8266/phone join) and joining home
+# WiFi. One radio does one mode at a time, so these are mutually exclusive.
+#
+#   cyberdeck-net ap            switch to hosting the AP (drops home WiFi)
+#   cyberdeck-net home          switch back to home WiFi (drops the AP)
+#   cyberdeck-net aptest [secs] host the AP, then auto-revert to home after
+#                               [secs] (default 300) UNLESS `cyberdeck-net keep`
+#                               is run first. Safe way to try the AP over a
+#                               link you'd otherwise lose.
+#   cyberdeck-net keep          cancel a pending aptest revert (make AP stick)
+#   cyberdeck-net status        show the current wlan0 mode
+#
+# NOTE: hosting the AP takes wlan0 off home WiFi, so any SSH over home WiFi drops
+# the instant you run `ap`/`aptest`. The deck's own screen always still works.
+set -u
+AP=cyberdeck-ap
+HOME_CON="${CYBERDECK_HOME_CON:-wronso-5g}"
+KEEP=/tmp/cyberdeck-ap-keep
+
+case "${1:-}" in
+  ap)
+    nmcli con up "$AP"
+    ;;
+  home)
+    rm -f "$KEEP"
+    nmcli con up "$HOME_CON"
+    ;;
+  aptest)
+    secs="${2:-300}"
+    rm -f "$KEEP"
+    # Detached with setsid so it survives the SSH session dropping when wlan0
+    # flips to AP mode. After `secs`, restore home WiFi unless `keep` was run.
+    setsid sh -c "sleep $secs; [ -f '$KEEP' ] || nmcli con up '$HOME_CON'" \
+        </dev/null >/dev/null 2>&1 &
+    sleep 1
+    logger -t cyberdeck-net "aptest: bringing up AP, auto-revert in ${secs}s"
+    nmcli con up "$AP"
+    ;;
+  keep)
+    touch "$KEEP"
+    echo "revert cancelled; AP will stay up"
+    ;;
+  status)
+    nmcli -t -f DEVICE,STATE,CONNECTION dev status | grep '^wlan0'
+    ;;
+  *)
+    echo "usage: cyberdeck-net {ap|home|aptest [secs]|keep|status}"
+    ;;
+esac

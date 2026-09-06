@@ -1,0 +1,16 @@
+#!/bin/sh
+# cyberdeck-ap-setup - (re)create the NetworkManager profile for the deck's own
+# 2.4 GHz AP that the Cardputer / ESP8266 / phone join. Run once. Pass a
+# password as $1, or one is generated. Does NOT activate it (autoconnect no);
+# bring it up with `cyberdeck-net ap` or safely with `cyberdeck-net aptest`.
+set -eu
+SSID="${CYBERDECK_AP_SSID:-cyberdeck}"
+PASS="${1:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)}"
+nmcli con delete cyberdeck-ap 2>/dev/null || true
+nmcli con add type wifi ifname wlan0 con-name cyberdeck-ap autoconnect no ssid "$SSID"
+nmcli con modify cyberdeck-ap 802-11-wireless.mode ap 802-11-wireless.band bg \
+    802-11-wireless.channel 6
+nmcli con modify cyberdeck-ap ipv4.method shared ipv4.addresses 192.168.4.1/24
+nmcli con modify cyberdeck-ap wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$PASS"
+echo "created AP profile: SSID=$SSID  PASS=$PASS  IP=192.168.4.1"
+echo "activate: cyberdeck-net ap   (safe test: cyberdeck-net aptest 300)"
