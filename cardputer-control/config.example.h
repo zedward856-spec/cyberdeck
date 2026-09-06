@@ -3,10 +3,11 @@
 #pragma once
 
 // --- WiFi (ESP32-S3 is 2.4 GHz ONLY - use the 2.4 GHz SSID, not a 5 GHz one) ---
-#define WIFI_SSID   "wronso-2.4g"
-#define WIFI_PASS   "your-2.4ghz-password"
+#define WIFI_SSID   "XPF1"
+#define WIFI_PASS   "your-hotspot-password"
 
 // --- The Pi cyberdeck ---
+#define PI_MDNS     "kali-raspberrypi"          // deck hostname, resolved via mDNS
 #define PI_HOST     "192.168.0.29"
 #define TELE_PORT   9000            // cyberdeck-telemetry (read-only status feed)
 #define CTRL_PORT   9100            // cyberdeck-control  (authenticated actions)

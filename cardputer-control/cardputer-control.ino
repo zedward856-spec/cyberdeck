@@ -14,7 +14,16 @@
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <ESPmDNS.h>
 #include "config.h"
+
+// Resolved Pi address (dynamic on a hotspot, so found by mDNS name each time).
+String gPiIp = "";
+void resolvePi() {
+  if (WiFi.status() != WL_CONNECTED) { gPiIp = ""; return; }
+  IPAddress ip = MDNS.queryHost(PI_MDNS, 2000);
+  if ((uint32_t)ip != 0) gPiIp = ip.toString();
+}
 
 // ---- palette (RGB565) ----
 #define C_BG     0x0861   // near-black #0d0f14
@@ -79,9 +88,11 @@ String field(const String &b, const char *key) {
 }
 
 void pollTelemetry() {
-  String url = String("http://") + PI_HOST + ":" + TELE_PORT + "/?since=0";
+  if (gPiIp == "") resolvePi();
+  if (gPiIp == "") { online = false; return; }
+  String url = String("http://") + gPiIp + ":" + TELE_PORT + "/?since=0";
   String b = httpGet(url, 1500);
-  if (b.length() == 0) { online = false; return; }
+  if (b.length() == 0) { online = false; gPiIp = ""; return; }   // re-resolve next time
   online = true; everData = true;
   gTemp = field(b, "TEMP ").toFloat();
   gLoad = field(b, "LOAD ").toFloat();
@@ -95,7 +106,9 @@ void pollTelemetry() {
 }
 
 String sendAction(const char *name) {
-  String url = String("http://") + PI_HOST + ":" + CTRL_PORT + "/do/" + name +
+  if (gPiIp == "") resolvePi();
+  if (gPiIp == "") return "no deck";
+  String url = String("http://") + gPiIp + ":" + CTRL_PORT + "/do/" + name +
                "?t=" + CTRL_TOKEN;
   String b = httpGet(url, 4000);
   b.trim();
@@ -247,7 +260,11 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  // The deck is close by, so cap TX power: the full-power transmit spike browns
+  // out the Cardputer on a low battery / marginal USB (reset loop otherwise).
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  MDNS.begin("cardputer");                 // for resolving the Pi by name
 
   cv->fillScreen(C_BG);
   cv->setTextColor(C_CYAN, C_BG); cv->setTextSize(2);
@@ -259,6 +276,12 @@ void setup() {
 
 void loop() {
   M5Cardputer.update();
+  static unsigned long dbg = 0;
+  if (millis() - dbg > 3000) {
+    dbg = millis();
+    Serial.printf("[deck] wifi=%d pi=%s online=%d\n",
+                  WiFi.status(), gPiIp.c_str(), (int)online);
+  }
   handleKeys();
   if (armed >= 0 && millis() - armedAt > 3000) armed = -1;   // confirm times out
   if (millis() - lastPoll > POLL_MS) { pollTelemetry(); lastPoll = millis(); }
