@@ -9,7 +9,8 @@
  *     RADIO  : SSID / signal / ESP IP / MAC / free heap  (ESP self-info offline)
  * - Boot splash: Kali dragon; tap any key = continue, hold DOWN = wifi setup.
  *   In dashboard: tap DOWN = refresh; hold DOWN ~1.5s = POWER menu
- *   (LEFT=power off, DOWN=back, RIGHT=reboot) via the deck control service.
+ *   (LEFT/RIGHT move the selection box over OFF/BACK/REBOOT, DOWN confirms;
+ *   BACK is the default selection). Sends to the deck control service.
  * - Screen blanks after 5 min idle (any key wakes it); the board LED stays lit.
  * Switch pins: LEFT=GPIO12  RIGHT=GPIO13  DOWN=GPIO14  (active-low)
  * Build: esp8266:esp8266, libs U8g2 + WiFiManager. Needs deckdash_config.h (token).
@@ -323,37 +324,50 @@ String sendCtrl(const char *action) {
   return r.length() ? r : "no reply";
 }
 
-// ---- power menu: L = power off, DOWN(middle) = back, R = reboot ----
+// ---- power menu: LEFT/RIGHT move the selection box, DOWN confirms ----
+// Options: OFF | BACK | REBOOT. BACK (middle) is selected by default, so a
+// stray DOWN safely exits. The footer shows only the selected option, centered.
 void powerMenu() {
   if (!oled) return;
-  while (digitalRead(PIN_DOWN) == LOW) delay(10);   // let go of the long-press first
-  delay(60);
+  // Entered while DOWN is still held (the long-press): show the menu immediately.
+  // Ignore the ongoing hold until DOWN is released once, so it isn't read as a
+  // confirm on the option that happens to be selected.
+  const char *shortL[3] = { "OFF", "BACK", "RBT" };
+  const char *longL[3]  = { "POWER OFF", "BACK", "REBOOT" };
+  const int   xpos[3]   = { 14, 54, 96 };
+  int sel = 1;                                       // middle (BACK) default
+  int lL = HIGH, lR = HIGH, lD = LOW;                // DOWN starts held
+  bool downReleased = false;
   for (;;) {
     oled->clearBuffer();
     oled->setFont(u8g2_font_7x13B_tf);
-    oled->drawStr(40, 12, "POWER"); oled->drawHLine(0, 15, 128);
+    { const char *t = "POWER"; oled->drawStr((128 - oled->getStrWidth(t)) / 2, 12, t); }
+    oled->drawHLine(0, 15, 128);
+    oled->setFont(u8g2_font_6x12_tf);
+    for (int i = 0; i < 3; i++) {
+      oled->drawStr(xpos[i], 36, shortL[i]);
+      if (i == sel)                                  // box around the selected one
+        oled->drawFrame(xpos[i] - 4, 24, oled->getStrWidth(shortL[i]) + 8, 16);
+    }
+    // footer: only the selected option, centered
     oled->setFont(u8g2_font_7x13B_tf);
-    oled->drawStr(6, 40, "OFF");      // left
-    oled->drawStr(50, 40, "BACK");    // middle (DOWN)
-    oled->drawStr(98, 40, "RBT");     // right (reboot)
-    oled->setFont(u8g2_font_5x7_tf);  // button-function footer
-    oled->drawStr(0, 62, "L:OFF   DOWN:BACK   R:REBOOT");
+    { const char *t = longL[sel]; oled->drawStr((128 - oled->getStrWidth(t)) / 2, 60, t); }
     oled->sendBuffer();
 
-    if (digitalRead(PIN_LEFT) == LOW) {
-      splash("POWER OFF", "sending...");
-      String r = sendCtrl("poweroff");
-      splash("POWER OFF", r.c_str()); delay(1600); return;
-    }
-    if (digitalRead(PIN_RIGHT) == LOW) {
-      splash("REBOOT", "sending...");
-      String r = sendCtrl("reboot");
-      splash("REBOOT", r.c_str()); delay(1600); return;
-    }
-    if (digitalRead(PIN_DOWN) == LOW) {               // back
+    int vL = digitalRead(PIN_LEFT), vR = digitalRead(PIN_RIGHT), vD = digitalRead(PIN_DOWN);
+    if (vD == HIGH) downReleased = true;             // the initial long-press let go
+    if (lL == HIGH && vL == LOW && sel > 0) sel--;   // move box left
+    if (lR == HIGH && vR == LOW && sel < 2) sel++;   // move box right
+    if (downReleased && lD == HIGH && vD == LOW) {    // confirm (only after release)
       while (digitalRead(PIN_DOWN) == LOW) delay(10);
+      if (sel == 1) return;                           // BACK
+      const char *act = (sel == 0) ? "poweroff" : "reboot";
+      splash(longL[sel], "sending...");
+      String r = sendCtrl(act);
+      splash(longL[sel], r.c_str()); delay(1600);
       return;
     }
+    lL = vL; lR = vR; lD = vD;
     delay(20);
   }
 }
