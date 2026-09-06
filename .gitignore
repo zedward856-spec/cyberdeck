@@ -17,3 +17,6 @@ cyberterm/cyberterm
 # esp build artifacts (keep only .bin)
 esp-dashboard/build/*.elf
 esp-dashboard/build/*.map
+
+# cardputer local secrets (WiFi pass + control token)
+cardputer-control/config.h

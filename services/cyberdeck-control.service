@@ -1,0 +1,18 @@
+[Unit]
+Description=Cyberdeck control endpoint (authenticated actions for the Cardputer panel)
+After=network.target
+
+[Service]
+Type=simple
+User=kali
+Group=kali
+ExecStart=/usr/local/bin/cyberdeck-control
+Restart=always
+RestartSec=3
+Nice=10
+# Needs to read the logged-in session's environ (to lock/launch on the display)
+# and spawn terminals, so it can't run under ProtectSystem=strict like telemetry.
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Cyberdeck control endpoint - authenticated actions for the Cardputer panel.
+
+This is deliberately SEPARATE from cyberdeck-telemetry (port 9000). Telemetry is
+a read-only feed consumed by the phone launcher and the ESP8266 dashboard; this
+service performs side effects (lock, reboot, launching tools), so it is gated by
+a shared token and exposes only a fixed whitelist of actions - never an arbitrary
+shell. Even on your own WiFi, an open remote-exec endpoint would let anything on
+the LAN root the deck.
+
+  GET /do/<action>?t=<token>     perform a whitelisted action
+  GET /list?t=<token>            list the available actions
+  GET /ping                      liveness (no token, no side effect)
+
+Bind: 0.0.0.0:9100 so the Cardputer can reach it over WiFi. The token lives in
+CONTROL_TOKEN_FILE (kali-owned, NOT in git); if absent, one is generated and
+printed to the log on first start.
+"""
+
+import hmac
+import os
+import secrets
+import subprocess
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+PORT = 9100
+TOKEN_FILE = os.environ.get(
+    "CONTROL_TOKEN_FILE",
+    os.path.expanduser("~/.config/cyberdeck/control-token"),
+)
+
+# A terminal on the deck display to host a launched TUI. cyberterm is this deck's
+# own terminal; alacritty is the session's default. Either is fine.
+TERMINAL = ["/usr/local/bin/cyberterm"]
+TERMINAL_FALLBACK = ["/usr/bin/alacritty", "--option", "window.startup_mode=\"Fullscreen\""]
+
+HOME = os.path.expanduser("~")
+
+
+# --------------------------------------------------------------- session env
+# Actions that draw on screen (lock, wake, launching a TUI) need the DISPLAY and
+# credentials of the logged-in xfce session. A systemd service has none of its
+# own, so we borrow them from the running session, exactly as cyberdeck-telemetry
+# does for its lock route.
+def _session_env():
+    want = ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % pid) as fh:
+                comm = fh.read().strip()
+        except OSError:
+            continue
+        if comm not in ("xfce4-session", "xfwm4", "xfdesktop", "alacritty", "cyberterm"):
+            continue
+        try:
+            with open("/proc/%s/environ" % pid, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        env = {}
+        for kv in raw.split(b"\0"):
+            if b"=" in kv:
+                k, v = kv.split(b"=", 1)
+                env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+        if "DISPLAY" in env:
+            out = dict(os.environ)
+            for k in want:
+                if k in env:
+                    out[k] = env[k]
+            return out
+    return None
+
+
+def _spawn_on_display(argv):
+    """Run argv detached in the deck's session; return a short status string."""
+    env = _session_env()
+    if env is None:
+        return "no session"
+    try:
+        subprocess.Popen(
+            argv, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return "ok"
+    except Exception as e:
+        return "err %s" % type(e).__name__
+
+
+def _run(argv, timeout=10):
+    try:
+        subprocess.run(argv, timeout=timeout, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "ok"
+    except Exception as e:
+        return "err %s" % type(e).__name__
+
+
+def _priv(argv, timeout=10):
+    """Run a privileged command: try directly, then via passwordless sudo."""
+    r = _run(argv, timeout)
+    if r == "ok":
+        return r
+    return _run(["/usr/bin/sudo", "-n"] + argv, timeout)
+
+
+def _term_in(cmd):
+    """Open the deck terminal running a shell command (a TUI tool)."""
+    term = TERMINAL if os.path.exists(TERMINAL[0]) else TERMINAL_FALLBACK
+    if term is TERMINAL_FALLBACK and not os.path.exists(term[0]):
+        return "no terminal"
+    # -e for cyberterm/alacritty: run a command then keep the shell if it exits
+    argv = term + ["-e", "bash", "-lc", cmd + '; echo; read -n1 -r -p "[done - key to close]"']
+    return _spawn_on_display(argv)
+
+
+# --------------------------------------------------------------- actions
+# The whole security model: every reachable side effect is a value in this dict.
+# The request names a key; it can never supply a command. Add capability by
+# adding an entry here, deliberately.
+def _lock():
+    env = _session_env()
+    if env is None:
+        return "no session"
+    # match cyberdeck-telemetry: xdotool to trigger the screensaver lock
+    try:
+        subprocess.run(["/usr/bin/xdotool", "key", "--clearmodifiers", "XF86ScreenSaver"],
+                       env=env, timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "ok"
+    except Exception:
+        return _spawn_on_display(["/usr/bin/xset", "dpms", "force", "off"])
+
+
+def _wake():
+    return _spawn_on_display(["/usr/bin/xset", "dpms", "force", "on"])
+
+
+ACTIONS = {
+    "lock":     ("Lock screen",        _lock),
+    "wake":     ("Wake screen",        _wake),
+    "reboot":   ("Reboot deck",        lambda: _priv(["/usr/bin/systemctl", "reboot"])),
+    "poweroff": ("Power off deck",     lambda: _priv(["/usr/bin/systemctl", "poweroff"])),
+    "wifi":     ("Launch WiFi recon",  lambda: _term_in("cd %s && python3 deck_wifi.py" % HOME)),
+    "ir":       ("Launch IR console",  lambda: _term_in("cd %s && python3 deck_ir.py" % HOME)),
+    "portal":   ("Launch portal test", lambda: _term_in("cd %s && python3 portal_tui.py" % HOME)),
+    # curated command palette (NOT an open shell) - extend deliberately
+    "screenshot": ("Screenshot to ~/Pictures",
+                   lambda: _spawn_on_display(["/usr/bin/scrot", "-z",
+                                              os.path.join(HOME, "Pictures", "deck-%Y%m%d-%H%M%S.png")])),
+    "netinfo":  ("Show IP / link",     lambda: _term_in("ip -br a; echo; iw dev 2>/dev/null | sed -n \"1,20p\"")),
+}
+
+
+# --------------------------------------------------------------- token
+def _load_token():
+    try:
+        with open(TOKEN_FILE) as fh:
+            t = fh.read().strip()
+        return t or None
+    except OSError:
+        return None
+
+
+def _ensure_token():
+    t = _load_token()
+    if t:
+        return t
+    t = secrets.token_urlsafe(18)
+    d = os.path.dirname(TOKEN_FILE)
+    try:
+        os.makedirs(d, exist_ok=True)
+        old = os.umask(0o077)
+        try:
+            with open(TOKEN_FILE, "w") as fh:
+                fh.write(t + "\n")
+        finally:
+            os.umask(old)
+        sys.stderr.write("cyberdeck-control: generated token -> %s\n" % TOKEN_FILE)
+        sys.stderr.write("cyberdeck-control: TOKEN = %s\n" % t)
+        sys.stderr.flush()
+    except OSError as e:
+        sys.stderr.write("cyberdeck-control: cannot write token: %s\n" % e)
+    return t
+
+
+TOKEN = _ensure_token()
+
+
+def _authed(q):
+    if not TOKEN:
+        return False
+    supplied = (q.get("t", [""])[0]) or ""
+    return hmac.compare_digest(supplied, TOKEN)
+
+
+# --------------------------------------------------------------- HTTP
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, code, body):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _hdr_token(self):
+        return self.headers.get("X-Deck-Token", "")
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        route = u.path
+        q = parse_qs(u.query)
+        # allow the token via header too, so it stays out of access logs/URLs
+        if self._hdr_token():
+            q.setdefault("t", [self._hdr_token()])
+
+        if route == "/ping":
+            self._send(200, "PONG\n")
+            return
+
+        if not _authed(q):
+            self._send(401, "UNAUTHORIZED\n")
+            self._log(route, "-", "401")
+            return
+
+        if route == "/list":
+            self._send(200, "".join("%s\t%s\n" % (k, v[0]) for k, v in sorted(ACTIONS.items())))
+            return
+
+        if route.startswith("/do/"):
+            name = route[len("/do/"):]
+            entry = ACTIONS.get(name)
+            if not entry:
+                self._send(404, "NO SUCH ACTION\n")
+                self._log(route, name, "404")
+                return
+            label, fn = entry
+            result = fn()
+            self._send(200, "%s %s\n" % (name.upper(), result))
+            self._log(route, name, result)
+            return
+
+        self._send(404, "NOT FOUND\n")
+
+    def _log(self, route, name, result):
+        sys.stderr.write("%s %s action=%s -> %s\n" % (
+            time.strftime("%H:%M:%S"), self.client_address[0], name, result))
+        sys.stderr.flush()
+
+    def log_message(self, *a):
+        pass
+
+
+if __name__ == "__main__":
+    bind = os.environ.get("CONTROL_BIND", "0.0.0.0")
+    sys.stderr.write("cyberdeck-control: listening on %s:%d (token %s)\n" % (
+        bind, PORT, "set" if TOKEN else "MISSING"))
+    sys.stderr.flush()
+    ThreadingHTTPServer((bind, PORT), Handler).serve_forever()

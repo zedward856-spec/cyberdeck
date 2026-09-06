@@ -1,0 +1,4 @@
+# Install to /etc/sudoers.d/cyberdeck-control  (chmod 440, root:root)
+# Lets the control service reboot/power off the deck without a password,
+# and nothing else. Validate with:  visudo -cf /etc/sudoers.d/cyberdeck-control
+kali ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff
