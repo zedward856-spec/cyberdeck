@@ -8,7 +8,8 @@
  *     SYSTEM : CPU load / throttle / SSH / clock
  *     RADIO  : SSID / signal / ESP IP / MAC / free heap  (ESP self-info offline)
  * - Boot splash: Kali dragon; tap any key = continue, hold DOWN = wifi setup.
- *   In dashboard: tap DOWN = refresh; hold DOWN ~1.5s = POWER menu
+ *   In dashboard: tap DOWN = GRAPH viewer (LEFT/RIGHT flip TEMP/LOAD/RAM,
+ *   DOWN exits); hold DOWN ~1.5s = POWER menu
  *   (LEFT/RIGHT move the selection box over OFF/BACK/REBOOT, DOWN confirms;
  *   BACK is the default selection). Sends to the deck control service.
  * - Screen blanks after 5 min idle (any key wakes it); the board LED stays lit.
@@ -41,6 +42,11 @@ bool ledUsable = true;
 const unsigned long SCREEN_OFF_MS = 5UL * 60UL * 1000UL;
 unsigned long lastActivity = 0;
 bool screenOff = false;
+
+// rolling history for the graph viewer (recorded every poll, ~6 min at 3s/sample)
+#define GRAPH_N 120
+float histTemp[GRAPH_N], histLoad[GRAPH_N], histRam[GRAPH_N];
+int   histCount = 0, histHead = 0;
 U8G2_SH1106_128X64_NONAME_F_SW_I2C *oled = nullptr;
 int SDAp = -1, SCLp = -1;
 
@@ -51,6 +57,7 @@ int SDAp = -1, SCLp = -1;
 const int NPAGES = 3;
 int page = 0;
 unsigned long lastFetch = 0;
+unsigned long indicatorUntil = 0;   // show page-indicator dots until this time, then bars
 
 // top-right widget region (bars + page indicator)
 #define REGX0 96
@@ -146,6 +153,12 @@ void fetch() {
   if (sp > 0) { gUsed = ram.substring(0,sp).toInt(); gTotal = ram.substring(sp+1).toInt(); }
   gThr = strtoul(field(body, "THROTTLED ").c_str(), nullptr, 0);
   gHaveData = true;
+  // record a sample for the graph viewer
+  histTemp[histHead] = gTemp.toFloat();
+  histLoad[histHead] = gLoad100 / 100.0f;
+  histRam[histHead]  = (gTotal > 0) ? (100.0f * gUsed / gTotal) : 0.0f;
+  histHead = (histHead + 1) % GRAPH_N;
+  if (histCount < GRAPH_N) histCount++;
 }
 
 int rssiBars() {
@@ -235,7 +248,11 @@ void drawBody() {
 // steady frame: body + wifi bars
 void render() {
   if (!oled) return;
-  oled->clearBuffer(); drawBody(); drawBars(); oled->sendBuffer();
+  oled->clearBuffer();
+  drawBody();
+  // top-right widget: page-indicator dots for 1s after a page change, else WiFi bars
+  if (millis() < indicatorUntil) drawIndicator(); else drawBars();
+  oled->sendBuffer();
 }
 
 // ---- region bit capture (read U8g2 full buffer directly) ----
@@ -372,6 +389,69 @@ void powerMenu() {
   }
 }
 
+// ---- graph viewer: DOWN tap opens it; LEFT/RIGHT flip series instantly ----
+struct GSeries { const char *name; float *buf; char fmt; const char *unit; float lo, hi; };
+GSeries GS[3] = {
+  { "TEMP", histTemp, 't', "C", 20, 90 },   // fixed scales -> calm, undramatic graph
+  { "LOAD", histLoad, 'l', "",   0,  4 },
+  { "RAM",  histRam,  'r', "%",  0, 100 },
+};
+const int GNS = 3;
+
+void drawGraph(int g) {
+  if (!oled) return;
+  oled->clearBuffer();
+  int last = (histHead - 1 + GRAPH_N) % GRAPH_N;
+  float cur = histCount ? GS[g].buf[last] : 0;
+  char v[16];
+  if      (GS[g].fmt == 't') snprintf(v, sizeof(v), "%.1f%s", cur, GS[g].unit);
+  else if (GS[g].fmt == 'l') snprintf(v, sizeof(v), "%.2f", cur);
+  else                       snprintf(v, sizeof(v), "%.0f%s", cur, GS[g].unit);
+  oled->setFont(u8g2_font_7x13B_tf);
+  oled->drawStr(0, 12, GS[g].name);
+  oled->drawStr(128 - oled->getStrWidth(v), 12, v);
+  oled->drawHLine(0, 15, 128);
+
+  const int gy0 = 20, gy1 = 61;
+  if (histCount >= 2) {
+    float mn = GS[g].lo, mx = GS[g].hi;              // fixed scale = less dramatic
+    int px = -1, py = -1;
+    for (int i = 0; i < histCount; i++) {
+      float val = GS[g].buf[(histHead - histCount + i + GRAPH_N) % GRAPH_N];
+      if (val < mn) val = mn; if (val > mx) val = mx;   // clamp into the fixed range
+      int x = i * 127 / (histCount - 1);
+      int y = gy1 - (int)((val - mn) / (mx - mn) * (gy1 - gy0));
+      if (px >= 0) oled->drawLine(px, py, x, y); else oled->drawPixel(x, y);
+      px = x; py = y;
+    }
+    oled->setFont(u8g2_font_5x7_tf);                 // fixed range labels
+    char b[10];
+    snprintf(b, sizeof(b), "%.0f", mx); oled->drawStr(0, gy0 + 6, b);
+    snprintf(b, sizeof(b), "%.0f", mn); oled->drawStr(0, gy1, b);
+  } else {
+    oled->setFont(u8g2_font_6x12_tf);
+    oled->drawStr(18, 42, "collecting...");
+  }
+  oled->sendBuffer();
+}
+
+void graphView() {
+  if (!oled) return;
+  while (digitalRead(PIN_DOWN) == LOW) delay(10);    // release the opening tap
+  delay(40);
+  int g = 0, lL = HIGH, lR = HIGH, lD = HIGH;
+  drawGraph(g);
+  for (;;) {
+    if (millis() - lastFetch > 3000) { fetch(); lastFetch = millis(); drawGraph(g); }
+    int vL = digitalRead(PIN_LEFT), vR = digitalRead(PIN_RIGHT), vD = digitalRead(PIN_DOWN);
+    if (lL == HIGH && vL == LOW) { g = (g + GNS - 1) % GNS; drawGraph(g); lastActivity = millis(); }
+    if (lR == HIGH && vR == LOW) { g = (g + 1) % GNS;       drawGraph(g); lastActivity = millis(); }
+    if (lD == HIGH && vD == LOW) { while (digitalRead(PIN_DOWN) == LOW) delay(10); return; }
+    lL = vL; lR = vR; lD = vD;
+    delay(15);                                         // no transition -> fast L/R
+  }
+}
+
 void setup() {
   Serial.begin(115200); delay(200);
   pinMode(PIN_LEFT, INPUT_PULLUP);
@@ -386,12 +466,13 @@ void setup() {
   if (LED_PIN == SDAp || LED_PIN == SCLp ||
       LED_PIN == PIN_LEFT || LED_PIN == PIN_RIGHT || LED_PIN == PIN_DOWN) ledUsable = false;
   if (ledUsable) { pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW); }  // LOW = on
-  bool wantSetup = bootSplash();               // Kali logo; hold DOWN = wifi setup
+  // Start connecting immediately so WiFi links up *while* the splash is showing.
   WiFi.mode(WIFI_STA);
   WiFi.persistent(true);
   WiFi.setAutoReconnect(true);
-  if (wantSetup || WiFi.SSID().length() == 0) startPortal();  // only blocks when asked / unconfigured
-  else WiFi.begin();                           // saved creds, NON-blocking -> straight to dashboard
+  if (WiFi.SSID().length()) WiFi.begin();       // saved creds -> connect during splash
+  bool wantSetup = bootSplash();               // Kali logo; hold DOWN = wifi setup
+  if (wantSetup || WiFi.SSID().length() == 0) startPortal();  // only if asked / unconfigured
   lastActivity = millis();                      // start the screen-off timer
   render();
 }
@@ -424,18 +505,22 @@ void loop() {
     return;
   }
 
-  if (fell(PIN_LEFT,  sL)) { page = (page + NPAGES - 1) % NPAGES; playTransition(); lastActivity = millis(); }
-  if (fell(PIN_RIGHT, sR)) { page = (page + 1) % NPAGES;         playTransition(); lastActivity = millis(); }
-  if (fell(PIN_DOWN,  sD)) {                    // tap = refresh, hold ~1.5s = power menu
+  if (fell(PIN_LEFT,  sL)) { page = (page + NPAGES - 1) % NPAGES; indicatorUntil = millis() + 1000; render(); lastActivity = millis(); }
+  if (fell(PIN_RIGHT, sR)) { page = (page + 1) % NPAGES;         indicatorUntil = millis() + 1000; render(); lastActivity = millis(); }
+  if (fell(PIN_DOWN,  sD)) {                    // tap = graph viewer, hold ~1.5s = power menu
     unsigned long t = millis();
     while (digitalRead(PIN_DOWN)==LOW && millis()-t < 1500) delay(10);
     if (digitalRead(PIN_DOWN)==LOW) { powerMenu(); }   // long-press -> off / back / reboot
-    else { splash("DeckDash","refreshing..."); }
-    lastFetch = 0; delay(80); lastActivity = millis();
+    else { graphView(); }                              // tap -> graph viewer
+    delay(80); lastActivity = millis();
     sD = digitalRead(PIN_DOWN);
+    render();                                          // restore the dashboard
   }
 
   if (millis() - lastFetch > 3000) { fetch(); lastFetch = millis(); changed = true; }
-  if (changed) render();
+  static bool wasInd = false;
+  bool indActive = (millis() < indicatorUntil);
+  if (changed || (wasInd && !indActive)) render();   // data change, or indicator just expired -> bars
+  wasInd = indActive;
   delay(15);
 }
